@@ -1,16 +1,17 @@
 # Web Scrapper — Shipping Container Tracker
 
-Playwright-based scrapers for tracking shipping containers across multiple carriers.
+Playwright-based scrapers for tracking shipping containers across multiple carriers, exposed via a FastAPI wrapper.
 
 ## Supported Carriers
 
-| Carrier | Script |
-|---|---|
-| Maersk | `script/maersk_tracker.py` |
-| COSCO | `script/cosco_tracker.py` |
-| MSC | `script/msc_tracker.py` |
-| Gold Star Line | `script/goldstarline_tracker.py` |
-| CMA CGM | `script/cmacgm_tracker.py` |
+| Carrier | Script | API value |
+|---|---|---|
+| Maersk | `script/maersk_tracker.py` | `maersk` |
+| COSCO | `script/cosco_tracker.py` | `cosco` |
+| MSC | `script/msc_tracker.py` | `msc` |
+| Gold Star Line | `script/goldstarline_tracker.py` | `goldstarline` |
+| CMA CGM | `script/cmacgm_tracker.py` | `cmacgm` |
+| PIL | `script/pil_tracker.py` | `pil` |
 
 ## Setup
 
@@ -22,43 +23,78 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
-## Usage
+Set your API key in `.env`:
 
-Each tracker exposes a single function you can import or run directly.
+```
+API_KEY=your-secret-key-here
+```
+
+## API
+
+Start the server:
 
 ```bash
-python script/maersk_tracker.py
-python script/cosco_tracker.py
-python script/goldstarline_tracker.py
-python script/msc_tracker.py
+uvicorn main:app --reload
 ```
 
-To use in your own code:
+### POST /track
 
-```python
-from script.maersk_tracker import get_maersk_tracking
-from script.goldstarline_tracker import get_goldstarline_tracking
+Tracks a container for a given carrier. Requires an `X-API-Key` header.
 
-result = get_maersk_tracking("PONU2003175", headless=True)
-print(result)
-```
-
-## Return Shape
-
-All trackers return a dict with at minimum:
+**Request**
 
 ```json
 {
-  "status": "success | not_found",
-  "container_number": "...",
-  ...carrier-specific fields...
+  "carrier": "pil",
+  "container_number": "HPCU5091307"
 }
 ```
 
-On failure, a `blocked_debug_*.html` file is saved in the project root for inspection.
+**Headers**
+
+```
+X-API-Key: your-secret-key-here
+```
+
+**Example**
+
+```bash
+curl -X POST http://localhost:8000/track \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-secret-key-here" \
+  -d '{"carrier": "pil", "container_number": "HPCU5091307"}'
+```
+
+**Response**
+
+```json
+{
+  "status": "success | not_found | error",
+  "container_number": "...",
+  "...": "carrier-specific fields"
+}
+```
+
+Supported `carrier` values: `maersk`, `msc`, `cmacgm`, `cosco`, `goldstarline`, `pil`
+
+## Direct Script Usage
+
+Each tracker can also be run or imported directly:
+
+```bash
+python script/maersk_tracker.py
+python script/pil_tracker.py
+```
+
+```python
+from script.pil_tracker import get_pil_tracking
+
+result = get_pil_tracking("HPCU5091307", headless=True)
+print(result)
+```
 
 ## Notes
 
 - Set `headless=False` during development to watch the browser
-- Debug HTML files (`blocked_debug_*.html`) are git-ignored
+- Debug HTML files (`blocked_debug_*.html`) are saved on failure and git-ignored
 - Scrapers include human-like delays to reduce bot detection
