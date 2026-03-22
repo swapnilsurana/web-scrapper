@@ -10,6 +10,7 @@ Playwright-based scrapers for tracking shipping containers across multiple carri
 | COSCO | `script/cosco_tracker.py` |
 | MSC | `script/msc_tracker.py` |
 | Gold Star Line | `script/goldstarline_tracker.py` |
+| CMA CGM | `script/cmacgm_tracker.py` |
 
 ## Setup
 
