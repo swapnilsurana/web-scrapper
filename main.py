@@ -51,5 +51,5 @@ def track(request: TrackRequest, key: str = Security(verify_api_key)):
             detail=f"Unsupported carrier '{request.carrier}'. Supported: {list(CARRIERS.keys())}",
         )
 
-    result = tracker(request.container_number, headless=True)
+    result = tracker(request.container_number, headless=False)
     return result
