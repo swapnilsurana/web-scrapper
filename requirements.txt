@@ -6,4 +6,5 @@ webdriver-manager==4.0.2
 psutil==6.1.0
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
-
+xvfbwrapper==0.2.23
+seleniumbase==4.47.5

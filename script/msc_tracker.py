@@ -136,14 +136,13 @@ def get_msc_tracking(container_no: str, headless: bool = False):
             page_content = page.content()
             soup = BeautifulSoup(page_content, 'html.parser')
 
-            tracking_results = soup.find_all('div', class_='msc-flow-tracking__details')
+            # --- General tracking info ---
             tracking_data = {}
-
+            tracking_results = soup.find_all('div', class_='msc-flow-tracking__details')
             for tracking_result in tracking_results:
                 details_list = tracking_result.find('ul')
                 if details_list:
-                    list_items = details_list.find_all('li')
-                    for item in list_items:
+                    for item in details_list.find_all('li'):
                         heading = item.find('span', class_='msc-flow-tracking__details-heading')
                         value = item.find('span', class_='msc-flow-tracking__details-value')
                         if heading and value:
@@ -152,6 +151,7 @@ def get_msc_tracking(container_no: str, headless: bool = False):
                             if key and val and '{' not in key and '{' not in val:
                                 tracking_data[key] = val
 
+            # --- Container summary bar info ---
             container_sections = soup.find_all('div', class_='msc-flow-tracking__container')
             for container_section in container_sections:
                 cells = container_section.find_all('div', class_='msc-flow-tracking__cell-flex')
@@ -165,6 +165,59 @@ def get_msc_tracking(container_no: str, headless: bool = False):
                             if key not in tracking_data:
                                 tracking_data[key] = val
 
+            # --- Events extraction ---
+            events = []
+            for container_section in container_sections:
+                tracking_div = container_section.find('div', class_='msc-flow-tracking__tracking')
+                if not tracking_div:
+                    continue
+                for port_div in tracking_div.find_all('div', class_='msc-flow-tracking__port'):
+                    step = port_div.find('div', class_='msc-flow-tracking__step')
+                    if not step:
+                        continue
+
+                    def get_cell_value(cell_class):
+                        cell = step.find('div', class_=cell_class)
+                        if cell:
+                            val = cell.find('span', class_='data-value')
+                            if val:
+                                return val.get_text(strip=True)
+                        return None
+
+                    date = get_cell_value('msc-flow-tracking__cell--two')
+                    location = get_cell_value('msc-flow-tracking__cell--three')
+                    description = get_cell_value('msc-flow-tracking__cell--four')
+
+                    # Detail (vessel/voyage) — cell five, first data-value
+                    detail = None
+                    cell_five = step.find('div', class_='msc-flow-tracking__cell--five')
+                    if cell_five:
+                        dv = cell_five.find('span', class_='data-value')
+                        if dv:
+                            detail = dv.get_text(strip=True)
+
+                    # Equipment handling facility — cell six, first data-value
+                    facility = None
+                    cell_six = step.find('div', class_='msc-flow-tracking__cell--six')
+                    if cell_six:
+                        dv = cell_six.find('span', class_='data-value')
+                        if dv:
+                            txt = dv.get_text(strip=True)
+                            if txt and txt != 'N.A' and '{' not in txt:
+                                facility = txt
+
+                    if date and description and '{' not in (date + description):
+                        event = {
+                            "date": date,
+                            "location": location,
+                            "description": description,
+                        }
+                        if detail:
+                            event["detail"] = detail
+                        if facility:
+                            event["facility"] = facility
+                        events.append(event)
+
             browser.close()
 
             if not tracking_data:
@@ -173,7 +226,8 @@ def get_msc_tracking(container_no: str, headless: bool = False):
             return {
                 "status": "success",
                 "container_number": container_no,
-                "data": tracking_data
+                "data": tracking_data,
+                "events": events
             }
 
 
