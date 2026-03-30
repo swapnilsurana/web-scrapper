@@ -10,6 +10,8 @@ from script.cmacgm_tracker import get_cmacgm_tracking
 from script.cosco_tracker import get_cosco_tracking
 from script.goldstarline_tracker import get_goldstarline_tracking
 from script.pil_tracker import get_pil_tracking
+from script.normalizer import normalize
+
 
 load_dotenv()
 
@@ -52,4 +54,4 @@ def track(request: TrackRequest, key: str = Security(verify_api_key)):
         )
 
     result = tracker(request.container_number, headless=False)
-    return result
+    return normalize(carrier, result)
