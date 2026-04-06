@@ -1,7 +1,7 @@
 import time
 import random
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
+from seleniumbase import SB
 from xvfbwrapper import Xvfb
 
 
@@ -9,92 +9,61 @@ def human_delay(a=1.5, b=3.5):
     time.sleep(random.uniform(a, b))
 
 
-def get_pil_tracking(container_no: str, headless: bool = False):
+def get_pil_tracking(container_no: str, headless: bool = False) -> dict:
     url = "https://www.pilship.com/digital-solutions/?tab=customer&id=track-trace&label=containerTandT"
 
     with Xvfb(width=1366, height=768, colordepth=24) as xvfb:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=headless,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                ]
-            )
+        with SB(
+            uc=True,
+            headless=headless,
+            locale_code="en",
+        ) as sb:
 
-            context = browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/123.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1366, "height": 768},
-                locale="en-US",
-                timezone_id="Asia/Kolkata",
-            )
-
-            page = context.new_page()
-
-            page.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {
-                    get: () => undefined
-                });
-            """)
-
-            print(f"🚢 Opening tracking: {url}")
-            page.goto(url, timeout=60000)
-            page.wait_for_load_state("domcontentloaded")
+            print(f"🔄 Opening tracking page for: {container_no}")
+            sb.uc_open(url)
             human_delay(3, 5)
 
-            print(f"📝 Entering container: {container_no}")
-            try:
-                page.wait_for_selector("#refNo", timeout=15000)
-                page.locator("#refNo").click()
-                page.type("#refNo", container_no, delay=150)
-                human_delay(1, 1.5)
+            if "challenge" in sb.get_current_url() or "Just a moment" in sb.get_page_source():
+                print("⚠️ Cloudflare detected, attempting bypass...")
+                sb.uc_gui_click_captcha()
+                human_delay(3, 5)
 
-                page.locator("#containerTTSearchDetail").click()
-                print("🔍 Search clicked")
+            try:
+                sb.wait_for_element("#refNo", timeout=20)
             except Exception as e:
-                print("⚠️ Failed to enter container number or click search")
-                browser.close()
+                print("⚠️ Failed to find container input")
+                with open("blocked_debug_pil.html", "w", encoding="utf-8") as f:
+                    f.write(sb.get_page_source())
                 return {"status": "error", "message": str(e), "container_number": container_no}
 
+            print(f"📝 Entering container: {container_no}")
+            sb.type("#refNo", container_no)
+            human_delay(1, 1.5)
+
+            print("🔍 Clicking Search...")
+            sb.click("#containerTTSearchDetail")
             human_delay(3, 5)
 
+            print("⏳ Waiting for results...")
             try:
-                found = False
-                for _ in range(20):
-                    if page.locator(".results-wrapper #results").first.is_visible():
-                        found = True
-                        break
-                    time.sleep(1)
-
-                if not found:
-                    with open("blocked_debug_pil.html", "w", encoding="utf-8") as f:
-                        f.write(page.content())
-                    raise Exception("Results not loaded or container not found")
-            except Exception as e:
-                print(f"⚠️ Exception waiting for results: {str(e)}")
-                try:
-                    with open("blocked_debug_pil.html", "w", encoding="utf-8") as f:
-                        f.write(page.content())
-                except:
-                    pass
-                browser.close()
+                sb.wait_for_element_visible(".results-wrapper #results", timeout=25)
+            except Exception:
+                if sb.is_text_visible("No results") or sb.is_text_visible("no record"):
+                    return {"status": "not_found", "container_number": container_no}
+                print("⚠️ Failed to load expected content — saving debug")
+                with open("blocked_debug_pil.html", "w", encoding="utf-8") as f:
+                    f.write(sb.get_page_source())
                 return {
                     "status": "error",
-                    "message": "Results not loaded or tracking not found",
-                    "container_number": container_no
+                    "message": "Blocked or DOM changed",
+                    "container_number": container_no,
                 }
 
             print("✅ Extracting data...")
-            soup = BeautifulSoup(page.content(), "html.parser")
+            soup = BeautifulSoup(sb.get_page_source(), "html.parser")
 
             results_div = soup.find("div", id="results")
             if not results_div:
-                browser.close()
                 return {"status": "not_found", "container_number": container_no}
 
             route_rows = []
@@ -103,15 +72,17 @@ def get_pil_tracking(container_no: str, headless: bool = False):
             if tables:
                 summary_table = tables[0].find("table")
                 if summary_table:
-                    for row in summary_table.find("tbody").find_all("tr", class_="resultrow"):
-                        cells = row.find_all("td")
-                        if len(cells) == 4:
-                            route_rows.append({
-                                "arrival_delivery": cells[0].get_text(" ", strip=True),
-                                "location": cells[1].get_text(" ", strip=True),
-                                "vessel_voyage": cells[2].get_text(" ", strip=True),
-                                "next_location": cells[3].get_text(" ", strip=True),
-                            })
+                    tbody = summary_table.find("tbody")
+                    if tbody:
+                        for row in tbody.find_all("tr", class_="resultrow"):
+                            cells = row.find_all("td")
+                            if len(cells) == 4:
+                                route_rows.append({
+                                    "arrival_delivery": cells[0].get_text(" ", strip=True),
+                                    "location": cells[1].get_text(" ", strip=True),
+                                    "vessel_voyage": cells[2].get_text(" ", strip=True),
+                                    "next_location": cells[3].get_text(" ", strip=True),
+                                })
 
             events = []
             if len(tables) > 1:
@@ -131,8 +102,6 @@ def get_pil_tracking(container_no: str, headless: bool = False):
                                     "event_place": cells[4].get_text(strip=True),
                                 })
 
-            browser.close()
-
             if not route_rows and not events:
                 return {"status": "not_found", "container_number": container_no}
 
@@ -144,13 +113,8 @@ def get_pil_tracking(container_no: str, headless: bool = False):
             }
 
 
-# -------------------------------
-# 🧪 RUN
-# -------------------------------
 if __name__ == "__main__":
     from pprint import pprint
 
-    CONTAINER_ID = "HPCU5091307"
-    result = get_pil_tracking(CONTAINER_ID, headless=False)
-
+    result = get_pil_tracking("HPCU5091307")
     pprint(result)
