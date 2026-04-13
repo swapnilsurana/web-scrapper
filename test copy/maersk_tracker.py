@@ -133,7 +133,23 @@ def get_maersk_tracking(container_no: str, headless: bool = False):
         last_updated = None
         eta = None
         latest_event = None
+        pol = None
+        pod = None
         events = []
+
+        try:
+            from_el = page.locator('[data-test="track-from-value"]').first
+            if from_el.count() > 0:
+                pol = from_el.inner_text().strip() or None
+        except:
+            pass
+
+        try:
+            to_el = page.locator('[data-test="track-to-value"]').first
+            if to_el.count() > 0:
+                pod = to_el.inner_text().strip() or None
+        except:
+            pass
 
         try:
             header = page.locator('[data-test="container"] header')
@@ -219,6 +235,8 @@ def get_maersk_tracking(container_no: str, headless: bool = False):
             "last_updated": last_updated,
             "eta": eta,
             "latest_event": latest_event,
+            "Port of Loading (POL)": pol,
+            "Port of Discharge (POD)": pod,
             "events": events,
         }
 
@@ -229,7 +247,7 @@ def get_maersk_tracking(container_no: str, headless: bool = False):
 if __name__ == "__main__":
     from pprint import pprint
 
-    container_id = "PONU2003175"
+    container_id = "MRKU0580031"
     result = get_maersk_tracking(container_id, headless=False)
 
     pprint(result)

@@ -46,9 +46,9 @@ def normalize_maersk(raw: dict) -> dict:
         "container_number": raw.get("container_number"),
         "basic_info": {
             "Container Number": raw.get("container_number"),
-            "Port of Loading (POL)": None,
+            "Port of Loading (POL)": _safe(raw.get("Port of Loading (POL)")),
             "Sailing Date": None,
-            "Port of Discharge (POD)": None,
+            "Port of Discharge (POD)": _safe(raw.get("Port of Discharge (POD)")),
             "Estimated Time of Arrival": _safe(raw.get("eta")),
             "Container Type": _safe(raw.get("container_type")),
             "shipment_status": _safe(raw.get("latest_event")),
