@@ -237,7 +237,7 @@ def get_cosco_tracking(container_no: str, headless: bool = False):
 if __name__ == "__main__":
     from pprint import pprint
 
-    CONTAINER_ID = "CSLU1914180"
+    CONTAINER_ID = "CSNU2742077"
     result = get_cosco_tracking(CONTAINER_ID, headless=False)
 
     pprint(result)
