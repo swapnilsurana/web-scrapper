@@ -1,5 +1,6 @@
 import time
 import random
+import re
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 from xvfbwrapper import Xvfb
@@ -158,8 +159,24 @@ def get_cosco_tracking(container_no: str, headless: bool = False):
             try:
                 container_header = frame.locator('div[data-v-b046195d] > div:first-child').first
                 if container_header.is_visible():
-                    c_num = container_header.locator('div').first.text_content().strip()
-                    tracking_data["Container Number"] = c_num
+                    header_text = (container_header.text_content() or "").strip()
+                    m = re.search(r"\b([A-Z]{4}\d{7})\b", header_text)
+                    tracking_data["Container Number"] = m.group(1) if m else header_text
+
+                    # Some COSCO pages show "Last Pod Eta" in the header block.
+                    m_eta = re.search(
+                        r"\b(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\b.*?\blast\s*pod\s*eta\b",
+                        header_text,
+                        flags=re.IGNORECASE,
+                    )
+                    if m_eta:
+                        tracking_data["Last POD ETA"] = m_eta.group(1)
+                        events.append({
+                            "dynamic_node": "Last POD ETA",
+                            "event_time": m_eta.group(1),
+                            "event_location": None,
+                            "transport_mode": None,
+                        })
 
                 size_element = frame.locator('span[data-v-b046195d]').filter(has_text="GP").first
                 if not size_element.is_visible():

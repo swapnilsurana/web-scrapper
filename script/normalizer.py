@@ -139,6 +139,7 @@ def normalize_cosco(raw: dict) -> dict:
             eta = _safe(e.get("event_time")) or _safe(e.get("event_location")) or _safe(e.get("transport_mode"))
             if eta:
                 break
+    eta = eta or _safe(data.get("Last POD ETA"))
 
     events = []
     for e in raw_events:
@@ -153,7 +154,7 @@ def normalize_cosco(raw: dict) -> dict:
         "status": "success",
         "container_number": raw.get("container_number"),
         "basic_info": {
-            "Container Number": _safe(data.get("Container Number")) or raw.get("container_number"),
+            "Container Number": raw.get("container_number"),
             "Port of Loading (POL)": None,
             "Sailing Date": None,
             "Port of Discharge (POD)": None,
