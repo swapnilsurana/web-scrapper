@@ -124,6 +124,22 @@ def normalize_cosco(raw: dict) -> dict:
     data = raw.get("data", {})
     raw_events = data.get("events", [])
 
+    # COSCO exposes ETA-like values as rows in the events table (e.g. "Last POD ETA").
+    # We derive ETA by scanning event "dynamic_node" labels from newest to oldest.
+    eta = None
+    for e in reversed(raw_events or []):
+        node = (e.get("dynamic_node") or "").strip().lower()
+        if not node:
+            continue
+        if "eta" in node and ("pod" in node or "discharge" in node or "arrival" in node):
+            eta = _safe(e.get("event_time")) or _safe(e.get("event_location")) or _safe(e.get("transport_mode"))
+            if eta:
+                break
+        if node in {"eta", "estimated time of arrival"}:
+            eta = _safe(e.get("event_time")) or _safe(e.get("event_location")) or _safe(e.get("transport_mode"))
+            if eta:
+                break
+
     events = []
     for e in raw_events:
         events.append({
@@ -141,7 +157,7 @@ def normalize_cosco(raw: dict) -> dict:
             "Port of Loading (POL)": None,
             "Sailing Date": None,
             "Port of Discharge (POD)": None,
-            "Estimated Time of Arrival": None,
+            "Estimated Time of Arrival": eta,
             "Container Type": _safe(data.get("Size Type")),
             "shipment_status": None,
         },
