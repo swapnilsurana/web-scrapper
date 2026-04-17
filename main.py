@@ -10,6 +10,7 @@ from script.cmacgm_tracker import get_cmacgm_tracking
 from script.cosco_tracker import get_cosco_tracking
 from script.goldstarline_tracker import get_goldstarline_tracking
 from script.pil_tracker import get_pil_tracking
+from script.one_tracker import get_one_tracking
 from script.normalizer import normalize
 
 
@@ -24,6 +25,7 @@ CARRIERS = {
     "cosco": get_cosco_tracking,
     "goldstarline": get_goldstarline_tracking,
     "pil": get_pil_tracking,
+    "one": get_one_tracking,
 }
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=True)

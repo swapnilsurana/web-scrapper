@@ -256,6 +256,47 @@ def normalize_pil(raw: dict) -> dict:
     }
 
 
+def normalize_one(raw: dict) -> dict:
+    if raw.get("status") != "success":
+        return raw
+
+    summary = raw.get("summary", {})
+    route = raw.get("route", {})
+    sailing = raw.get("sailing_information", [])
+    sail = sailing[0] if sailing else {}
+
+    pol = _safe(sail.get("port_of_loading")) or _safe(route.get("place_of_receipt"))
+    pod = _safe(sail.get("port_of_discharge")) or _safe(summary.get("pod_location")) or _safe(route.get("place_of_delivery"))
+    eta = _safe(sail.get("arrival_time")) or _safe(summary.get("pod_vessel_arrival"))
+    sailing_date = _safe(sail.get("departure_date"))
+    vessel = _safe(sail.get("vessel"))
+
+    events = []
+    for e in raw.get("events", []):
+        vv = _safe(e.get("vessel")) or vessel
+        events.append({
+            "Description": _safe(e.get("event")),
+            "Location": _safe(e.get("location")),
+            "Date": _safe(e.get("time")),
+            "Vessel / Voyage": vv,
+        })
+
+    return {
+        "status": "success",
+        "container_number": raw.get("container_number"),
+        "basic_info": {
+            "Container Number": summary.get("container_no") or raw.get("container_number"),
+            "Port of Loading (POL)": pol,
+            "Sailing Date": sailing_date,
+            "Port of Discharge (POD)": pod,
+            "Estimated Time of Arrival": eta,
+            "Container Type": _safe(summary.get("container_type")),
+            "shipment_status": _safe(summary.get("latest_event")),
+        },
+        "activities/events": events,
+    }
+
+
 NORMALIZERS = {
     "maersk": normalize_maersk,
     "msc": normalize_msc,
@@ -263,6 +304,7 @@ NORMALIZERS = {
     "cosco": normalize_cosco,
     "goldstarline": normalize_goldstarline,
     "pil": normalize_pil,
+    "one": normalize_one,
 }
 
 
