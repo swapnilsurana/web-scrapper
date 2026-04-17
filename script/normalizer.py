@@ -209,16 +209,26 @@ def normalize_goldstarline(raw: dict) -> dict:
     }
 
 
+def _extract_date(text):
+    """Extract a date (DD-Mon-YYYY) from a string like 'TGLFW 23-Apr-2026'."""
+    if not text:
+        return None
+    import re
+    m = re.search(r'\d{1,2}-[A-Za-z]{3}-\d{4}', text)
+    return m.group(0) if m else None
+
+
 def normalize_pil(raw: dict) -> dict:
     if raw.get("status") != "success":
         return raw
 
-    # Try to extract POL/POD/ETA from route_summary
     route = raw.get("route_summary", [])
     pol = route[0].get("location") if route else None
     pod = route[-1].get("location") if len(route) > 1 else None
-    eta = route[-1].get("arrival_delivery") if len(route) > 1 else None
     vessel_voyage = route[0].get("vessel_voyage") if route else None
+
+    # ETA from the next_location date of the last route row
+    eta = _extract_date(route[-1].get("next_location")) if route else None
 
     events = []
     for e in raw.get("events", []):
