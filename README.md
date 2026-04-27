@@ -12,6 +12,7 @@ Playwright-based scrapers for tracking shipping containers across multiple carri
 | Gold Star Line | `script/goldstarline_tracker.py` | `goldstarline` |
 | CMA CGM | `script/cmacgm_tracker.py` | `cmacgm` |
 | PIL | `script/pil_tracker.py` | `pil` |
+| ONE (Ocean Network Express) | `script/one_tracker.py` | `one` |
 
 ## Setup
 
@@ -27,6 +28,12 @@ Set your API key in `.env`:
 
 ```
 API_KEY=your-secret-key-here
+```
+
+Optional: limit how many tracking jobs can run at once (additional requests will wait in a queue):
+
+```
+MAX_CONCURRENT_TRACKING_JOBS=3
 ```
 
 ## API
@@ -75,7 +82,7 @@ curl -X POST http://localhost:8000/track \
 }
 ```
 
-Supported `carrier` values: `maersk`, `msc`, `cmacgm`, `cosco`, `goldstarline`, `pil`
+Supported `carrier` values: `maersk`, `msc`, `cmacgm`, `cosco`, `goldstarline`, `pil`, `one`
 
 ## Direct Script Usage
 

@@ -12,6 +12,7 @@ from script.goldstarline_tracker import get_goldstarline_tracking
 from script.pil_tracker import get_pil_tracking
 from script.one_tracker import get_one_tracking
 from script.normalizer import normalize
+from script.tracking_queue import tracking_queue
 
 
 load_dotenv()
@@ -55,5 +56,6 @@ def track(request: TrackRequest, key: str = Security(verify_api_key)):
             detail=f"Unsupported carrier '{request.carrier}'. Supported: {list(CARRIERS.keys())}",
         )
 
-    result = tracker(request.container_number, headless=False)
+    future = tracking_queue.submit(tracker, request.container_number, headless=False)
+    result = future.result()
     return normalize(carrier, result)
