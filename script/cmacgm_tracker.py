@@ -9,7 +9,7 @@ def get_cmacgm_tracking(container_no: str, headless: bool = False) -> dict:
     with Xvfb(width=1366, height=768, colordepth=24) as xvfb:
         with SB(
             uc=True,
-            headless=False,   # ✅ Works on VPS via Xvfb
+            headless=headless,   # ✅ Works on VPS via Xvfb
             locale_code="en",
         ) as sb:
 
@@ -26,15 +26,82 @@ def get_cmacgm_tracking(container_no: str, headless: bool = False) -> dict:
                 sb.uc_gui_click_captcha()
                 human_delay(3, 5)
 
-            # Wait for page to be ready
-            sb.wait_for_element("#Reference", timeout=20)
-            print(f"📦 Entering container number: {container_no}")
+            # Wait for page to be ready (and dismiss common consent dialogs)
+            try:
+                sb.wait_for_ready_state_complete(timeout=20)
+            except Exception:
+                pass
 
-            sb.type("#Reference", container_no)
+            # Cookie / consent banners frequently block the input from rendering/clicking
+            for sel in (
+                "button#onetrust-accept-btn-handler",
+                "button:contains('Accept all')",
+                "button:contains('Accept All')",
+                "button:contains('Accept')",
+                "button:contains('I agree')",
+                "button:contains('AGREE')",
+            ):
+                try:
+                    sb.click_if_visible(sel)
+                except Exception:
+                    pass
+
+            # CMA CGM has changed this DOM multiple times; try several stable selectors
+            reference_selectors = [
+                "#Reference",
+                "#reference",
+                "input#Reference",
+                "input#reference",
+                "input[name='Reference']",
+                "input[name='reference']",
+                "input[placeholder*='Container']",
+                "input[placeholder*='container']",
+                "input[type='text'][id*='Refer']",
+                "input[type='text'][name*='Refer']",
+            ]
+
+            reference_selector = None
+            for sel in reference_selectors:
+                try:
+                    sb.wait_for_element_visible(sel, timeout=6)
+                    reference_selector = sel
+                    break
+                except Exception:
+                    continue
+
+            if not reference_selector:
+                debug_path = "blocked_debug_cmacgm.html"
+                try:
+                    with open(debug_path, "w", encoding="utf-8") as f:
+                        f.write(sb.get_page_source())
+                except Exception:
+                    pass
+                return {
+                    "status": "error",
+                    "message": "Failed to locate the container reference input (DOM changed or blocked).",
+                    "container_number": container_no,
+                    "debug_html": debug_path,
+                }
+
+            print(f"📦 Entering container number: {container_no}")
+            sb.type(reference_selector, container_no)
             human_delay(0.5, 1.0)
 
             print("🔍 Clicking Search...")
-            sb.click("#btnTracking")
+            # Button selector also changes; try the known id first then fallbacks
+            for btn_sel in (
+                "#btnTracking",
+                "button#btnTracking",
+                "button:contains('Search')",
+                "button:contains('TRACK')",
+                "button:contains('Track')",
+            ):
+                try:
+                    if sb.is_element_visible(btn_sel):
+                        sb.click(btn_sel)
+                        break
+                except Exception:
+                    continue
 
             # Wait for results
             print("⏳ Waiting for results...")
@@ -43,7 +110,18 @@ def get_cmacgm_tracking(container_no: str, headless: bool = False) -> dict:
             except Exception:
                 if sb.is_text_visible("No results"):
                     return {"status": "not_found", "container_number": container_no}
-                raise Exception("Results did not load — possible block")
+                debug_path = "blocked_debug_cmacgm.html"
+                try:
+                    with open(debug_path, "w", encoding="utf-8") as f:
+                        f.write(sb.get_page_source())
+                except Exception:
+                    pass
+                return {
+                    "status": "error",
+                    "message": "Results did not load (possibly blocked or DOM changed).",
+                    "container_number": container_no,
+                    "debug_html": debug_path,
+                }
 
             result = {
                 "status": "success",
