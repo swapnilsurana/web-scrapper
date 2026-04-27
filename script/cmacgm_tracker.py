@@ -1,9 +1,56 @@
 from seleniumbase import SB
 from xvfbwrapper import Xvfb
+import json
+import os
 import time, random
 
 def human_delay(a=1.0, b=2.5):
     time.sleep(random.uniform(a, b))
+
+def _cookies_path() -> str:
+    # Stored relative to repo root when invoked from there.
+    return os.path.join("script", ".cookies_cmacgm.json")
+
+def _load_cookies_if_present(sb) -> None:
+    path = _cookies_path()
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cookies = json.load(f)
+        if isinstance(cookies, list):
+            sb.driver.delete_all_cookies()
+            for c in cookies:
+                if isinstance(c, dict):
+                    # Selenium will reject some keys; pass through as-is and ignore failures.
+                    try:
+                        sb.driver.add_cookie(c)
+                    except Exception:
+                        pass
+    except Exception:
+        return
+
+def _save_cookies(sb) -> None:
+    path = _cookies_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(sb.driver.get_cookies(), f)
+    except Exception:
+        pass
+
+def _is_datadome_blocked(sb) -> bool:
+    try:
+        src = sb.get_page_source()
+    except Exception:
+        return False
+    # Typical DataDome interstitial/captcha indicators
+    return (
+        "captcha-delivery.com" in src
+        or "DataDome" in src
+        or "geo.captcha-delivery.com" in src
+        or "ct.captcha-delivery.com" in src
+    )
 
 def get_cmacgm_tracking(container_no: str, headless: bool = False) -> dict:
     with Xvfb(width=1366, height=768, colordepth=24) as xvfb:
@@ -26,9 +73,54 @@ def get_cmacgm_tracking(container_no: str, headless: bool = False) -> dict:
                 sb.uc_gui_click_captcha()
                 human_delay(3, 5)
 
+            # DataDome CAPTCHA (served in an iframe) cannot be bypassed reliably in headless automation.
+            # If running headed, allow a manual solve and persist cookies for later runs.
+            if _is_datadome_blocked(sb):
+                debug_path = "blocked_debug_cmacgm.html"
+                try:
+                    with open(debug_path, "w", encoding="utf-8") as f:
+                        f.write(sb.get_page_source())
+                except Exception:
+                    pass
+
+                if headless:
+                    return {
+                        "status": "blocked",
+                        "blocker": "datadome_captcha",
+                        "message": "DataDome CAPTCHA detected. Run with headless=False and solve once to generate cookies, or use a proxy/residential IP.",
+                        "container_number": container_no,
+                        "debug_html": debug_path,
+                    }
+
+                print("🧩 DataDome CAPTCHA detected. Please solve it in the browser window.")
+                # Try waiting for the real page to render after manual solve
+                for _ in range(24):  # ~120s
+                    human_delay(4.5, 5.5)
+                    if not _is_datadome_blocked(sb):
+                        try:
+                            _save_cookies(sb)
+                        except Exception:
+                            pass
+                        break
+                else:
+                    return {
+                        "status": "blocked",
+                        "blocker": "datadome_captcha",
+                        "message": "CAPTCHA still present after waiting. Solve manually or switch IP/proxy.",
+                        "container_number": container_no,
+                        "debug_html": debug_path,
+                    }
+
             # Wait for page to be ready (and dismiss common consent dialogs)
             try:
                 sb.wait_for_ready_state_complete(timeout=20)
+            except Exception:
+                pass
+
+            # Attempt cookie reuse (only helps if you've solved the CAPTCHA once)
+            try:
+                _load_cookies_if_present(sb)
+                sb.open(url)
             except Exception:
                 pass
 
