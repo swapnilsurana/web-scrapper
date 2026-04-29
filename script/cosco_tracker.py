@@ -30,6 +30,44 @@ def handle_cookie_popup(page):
     print("ℹ️ No cookie popup found")
 
 
+def get_tracking_context(page):
+    """
+    Return the correct locator context for the tracking UI.
+    COSCO sometimes renders the tracking form inside #scctCargoTracking iframe,
+    and sometimes directly on the main page.
+    """
+    print("🔎 Detecting tracking form context...")
+    iframe_candidates = [
+        "#scctCargoTracking",
+        'iframe[src*="cargoTracking"]',
+        "iframe",
+    ]
+
+    for selector in iframe_candidates:
+        try:
+            iframe = page.locator(selector).first
+            if iframe.count() == 0:
+                continue
+            iframe.wait_for(state="attached", timeout=5000)
+            context = page.frame_locator(selector).first
+            context.locator(".ant-select-selector, input.ant-input").first.wait_for(
+                state="visible", timeout=7000
+            )
+            print(f"✅ Using iframe context: {selector}")
+            return context
+        except Exception:
+            continue
+
+    try:
+        page.locator(".ant-select-selector, input.ant-input").first.wait_for(
+            state="visible", timeout=10000
+        )
+        print("✅ Using main page context")
+        return page
+    except Exception as e:
+        raise Exception(f"Tracking form not found in iframe or main page: {e}")
+
+
 def get_cosco_tracking(container_no: str, headless: bool = False):
     url = "https://elines.coscoshipping.com/ebusiness/cargoTracking"
 
@@ -75,16 +113,16 @@ def get_cosco_tracking(container_no: str, headless: bool = False):
             page.mouse.move(200, 200)
             human_delay(1, 2)
 
-            frame = page.frame_locator('#scctCargoTracking')
+            context = get_tracking_context(page)
 
             try:
                 print("[*] Selecting 'Container No.' from dropdown...")
-                dropdown_selector = frame.locator('.ant-select-selector').first
+                dropdown_selector = context.locator('.ant-select-selector').first
                 dropdown_selector.wait_for(state="visible", timeout=10000)
                 dropdown_selector.click()
                 human_delay(0.5, 1)
 
-                container_option = frame.locator('.ant-select-item-option').filter(has_text="Container No.").first
+                container_option = context.locator('.ant-select-item-option').filter(has_text="Container No.").first
                 container_option.wait_for(state="visible", timeout=5000)
                 container_option.click()
                 human_delay(0.5, 1)
@@ -94,14 +132,14 @@ def get_cosco_tracking(container_no: str, headless: bool = False):
 
             print(f"📝 Entering container: {container_no}")
             try:
-                input_field = frame.locator('input.ant-input').first
+                input_field = context.locator('input.ant-input').first
                 input_field.wait_for(state="visible", timeout=5000)
                 input_field.click()
                 input_field.fill("")
                 input_field.type(container_no, delay=150)
                 human_delay(1, 1.5)
 
-                search_button = frame.locator('button.ant-btn-default').filter(has_text="Search").first
+                search_button = context.locator('button.ant-btn-default').filter(has_text="Search").first
                 search_button.wait_for(state="visible", timeout=5000)
                 search_button.click()
                 print("🔍 Search clicked")
@@ -120,11 +158,11 @@ def get_cosco_tracking(container_no: str, headless: bool = False):
             try:
                 found = False
                 for _ in range(20):
-                    if frame.locator(".ant-table-tbody").first.is_visible():
+                    if context.locator(".ant-table-tbody").first.is_visible():
                         time.sleep(2)
                         found = True
                         break
-                    if frame.locator("text=No data found").first.is_visible() or frame.locator("text=No results").first.is_visible():
+                    if context.locator("text=No data found").first.is_visible() or context.locator("text=No results").first.is_visible():
                         found = True
                         break
                     time.sleep(1)
@@ -148,7 +186,7 @@ def get_cosco_tracking(container_no: str, headless: bool = False):
                     "container_number": container_no
                 }
 
-            if frame.locator("text=No data found").count() > 0 or frame.locator("text=No results").count() > 0:
+            if context.locator("text=No data found").count() > 0 or context.locator("text=No results").count() > 0:
                 browser.close()
                 return {"status": "not_found", "container_number": container_no}
 
@@ -161,7 +199,7 @@ def get_cosco_tracking(container_no: str, headless: bool = False):
 
                 # The header flex row concatenates: container + size + datetime + "Last Pod Eta" + "Print".
                 # Grab its full text and regex-extract the ETA if "last pod eta" is present.
-                header_flex = frame.locator('div[data-v-b046195d].ant-flex').first
+                header_flex = context.locator('div[data-v-b046195d].ant-flex').first
                 if header_flex.is_visible():
                     header_text = (header_flex.text_content() or "").strip()
                     if re.search(r"last\s*pod\s*eta", header_text, re.IGNORECASE):
@@ -176,13 +214,13 @@ def get_cosco_tracking(container_no: str, headless: bool = False):
                             })
 
                 # Extract Size Type
-                size_element = frame.locator('span[data-v-b046195d]').filter(has_text="GP").first
+                size_element = context.locator('span[data-v-b046195d]').filter(has_text="GP").first
                 if not size_element.is_visible():
-                    size_element = frame.locator('span[data-v-b046195d]').filter(has_text="HQ").first
+                    size_element = context.locator('span[data-v-b046195d]').filter(has_text="HQ").first
                 if size_element.is_visible():
                     tracking_data["Size Type"] = size_element.text_content().strip()
 
-                rows = frame.locator('.ant-table-tbody tr.ant-table-row')
+                rows = context.locator('.ant-table-tbody tr.ant-table-row')
                 for i in range(rows.count()):
                     row = rows.nth(i)
                     cells = row.locator('td')
