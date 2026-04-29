@@ -68,6 +68,38 @@ def get_tracking_context(page):
         raise Exception(f"Tracking form not found in iframe or main page: {e}")
 
 
+def detect_cosco_block(page):
+    """
+    Detect COSCO anti-bot/403 page and extract debug metadata.
+    """
+    try:
+        html = page.content()
+    except Exception:
+        return None
+
+    lowered = html.lower()
+    block_markers = [
+        "403 forbidden",
+        "your current behavior is detected as abnormal",
+        "blocksrc.haplat.net",
+    ]
+    if not any(marker in lowered for marker in block_markers):
+        return None
+
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text(" ", strip=True)
+
+    event_match = re.search(r"event-id\s*:\s*([a-zA-Z0-9]+)", text, re.IGNORECASE)
+    ip_match = re.search(r"client-ip\s*:\s*([0-9a-fA-F\.:]+)", text, re.IGNORECASE)
+
+    return {
+        "status": "blocked",
+        "message": "COSCO blocked this request as abnormal traffic",
+        "event_id": event_match.group(1) if event_match else None,
+        "client_ip": ip_match.group(1) if ip_match else None,
+    }
+
+
 def get_cosco_tracking(container_no: str, headless: bool = False):
     url = "https://elines.coscoshipping.com/ebusiness/cargoTracking"
 
@@ -107,13 +139,30 @@ def get_cosco_tracking(container_no: str, headless: bool = False):
             page.wait_for_load_state("domcontentloaded")
             human_delay(3, 5)
 
+            blocked_info = detect_cosco_block(page)
+            if blocked_info:
+                print("⛔ COSCO anti-bot block detected right after page load")
+                browser.close()
+                blocked_info["container_number"] = container_no
+                return blocked_info
+
             handle_cookie_popup(page)
             human_delay(1, 2)
 
             page.mouse.move(200, 200)
             human_delay(1, 2)
 
-            context = get_tracking_context(page)
+            try:
+                context = get_tracking_context(page)
+            except Exception as e:
+                blocked_info = detect_cosco_block(page)
+                if blocked_info:
+                    print("⛔ COSCO anti-bot block detected during form detection")
+                    browser.close()
+                    blocked_info["container_number"] = container_no
+                    return blocked_info
+                browser.close()
+                return {"status": "error", "message": str(e), "container_number": container_no}
 
             try:
                 print("[*] Selecting 'Container No.' from dropdown...")
