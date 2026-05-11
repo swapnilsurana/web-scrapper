@@ -475,7 +475,7 @@ def track_maersk_visiwise(container_no: str, headless: bool = True) -> dict[str,
     returns the same shape as ``script.maersk_tracker.get_maersk_tracking`` on success
     so ``normalize_maersk`` stays unchanged.
     """
-    raw = track_visiwise_dashboard(container_no, carrier="Maersk", headless=headless)
+    raw = track_visiwise_dashboard(container_no, carrier="Maersk", headless=True)
     if raw.get("status") != "success":
         err_status = raw.get("status", "error")
         if err_status == "not_found":
