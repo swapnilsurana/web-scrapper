@@ -143,7 +143,7 @@ def _build_driver(proxy: Optional[str] = None) -> uc.Chrome:
     driver = uc.Chrome(
         options=options,
         use_subprocess=True,   # isolates each session in its own process
-        version_main=147,     # auto-detect installed Chrome version
+        version_main=146,     # auto-detect installed Chrome version
     )
 
     # Extra JS stealth patches on top of what uc already does
