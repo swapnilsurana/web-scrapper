@@ -38,6 +38,17 @@ def handle_cookie_popup(page):
 TRACKING_PAGE_URL = "https://www.maersk.com/tracking/"
 
 
+def _normalized_container(container_no: str) -> str:
+    s = re.sub(r"\s+", "", (container_no or "").strip().upper())
+    if not s:
+        raise ValueError("container_no is empty")
+    return s
+
+
+def _direct_tracking_url(container_no: str) -> str:
+    return f"https://www.maersk.com/tracking/{_normalized_container(container_no)}"
+
+
 def _default_user_agent() -> str:
     if sys.platform == "darwin":
         return (
@@ -67,6 +78,22 @@ def _container_panel_visible(page) -> bool:
         return page.locator('[data-test="container"]').first.is_visible()
     except Exception:
         return False
+
+
+def _poll_until_outcome(page, phase: str) -> str:
+    """Returns 'container', 'no_results', or 'timeout'."""
+    print(f"⏳ [{phase}] waiting up to ~45s for container panel or visible no-results …")
+    for i in range(45):
+        if _container_panel_visible(page):
+            print(f"✅ [{phase}] container panel visible (iteration {i + 1})")
+            return "container"
+        if _visible_no_results_message(page):
+            print(f"ℹ️  [{phase}] visible 'No results found' (iteration {i + 1})")
+            return "no_results"
+        if (i + 1) % 10 == 0:
+            print(f"⏳ [{phase}] still waiting… {i + 1}/45")
+        time.sleep(1)
+    return "timeout"
 
 
 def _safe_filename_part(text: str) -> str:
@@ -117,6 +144,7 @@ def cycle_air_then_ocean_booking_type(page) -> None:
 
 
 def submit_container_search(page, container_no: str):
+    cn = _normalized_container(container_no)
     cycle_air_then_ocean_booking_type(page)
     print("⌨️  Focusing search field (container will be entered next)")
     search = page.get_by_placeholder("BL or container number")
@@ -127,8 +155,8 @@ def submit_container_search(page, container_no: str):
     human_delay(0.1, 0.3)
     search.clear()
     human_delay(0.1, 0.2)
-    print(f"⌨️  Entering container number: {container_no!r}")
-    search.fill(container_no)
+    print(f"⌨️  Typing container number (normalized): {cn!r}")
+    search.press_sequentially(cn, delay=random.uniform(25, 55))
     human_delay(0.3, 0.6)
     print("🖱️  Clicking Track")
     page.get_by_role("button", name="Track").first.click()
@@ -140,7 +168,8 @@ def submit_container_search(page, container_no: str):
 
 
 def get_maersk_tracking(container_no: str, headless: bool = False):
-    print(f"🚀 Maersk tracking start container={container_no!r} headless={headless}")
+    cn = _normalized_container(container_no)
+    print(f"🚀 Maersk tracking start container={container_no!r} normalized={cn!r} headless={headless}")
     with Xvfb(width=1366, height=768, colordepth=24) as xvfb:
         with sync_playwright() as p:
             browser = p.chromium.launch(
@@ -187,28 +216,14 @@ def get_maersk_tracking(container_no: str, headless: bool = False):
             human_delay(1, 2)
             handle_cookie_popup(page)
             human_delay(0.5, 1)
-            submit_container_search(page, container_no)
+            submit_container_search(page, cn)
 
             print("⏳ Initial settle after submit (3s) …")
             time.sleep(3)
 
             try:
-                found = False
-                print("⏳ Waiting up to ~45s for container panel or visible no-results …")
-                for i in range(45):
-                    if _container_panel_visible(page):
-                        print(f"✅ Container panel visible (poll iteration {i + 1})")
-                        found = True
-                        break
-                    if _visible_no_results_message(page):
-                        print(f"ℹ️  Visible 'No results found' (poll iteration {i + 1})")
-                        found = True
-                        break
-                    if (i + 1) % 10 == 0:
-                        print(f"⏳ Still waiting… {i + 1}/45")
-                    time.sleep(1)
-
-                if not found:
+                outcome = _poll_until_outcome(page, "form submit")
+                if outcome == "timeout":
                     print("⚠️ Failed to load expected content — saving debug")
                     with open("blocked_debug.html", "w", encoding="utf-8") as f:
                         f.write(page.content())
@@ -217,25 +232,50 @@ def get_maersk_tracking(container_no: str, headless: bool = False):
                 print("⚠️ Failed to load expected content — saving debug")
                 with open("blocked_debug.html", "w", encoding="utf-8") as f:
                     f.write(page.content())
-                save_final_screenshot(page, container_no, "blocked_timeout")
+                save_final_screenshot(page, cn, "blocked_timeout")
                 browser.close()
                 raise Exception("Blocked or DOM changed")
 
             if _container_panel_visible(page):
                 print("📦 Result: tracking data present — parsing DOM …")
             elif _visible_no_results_message(page):
-                shot = save_final_screenshot(page, container_no, "not_found")
-                browser.close()
-                return {
-                    "status": "not_found",
-                    "container_number": container_no,
-                    "screenshot": shot,
-                }
+                direct = _direct_tracking_url(cn)
+                print(f"↪️ Form returned no results — retrying direct URL: {direct}")
+                page.goto(direct, timeout=60000)
+                page.wait_for_load_state("domcontentloaded")
+                human_delay(2, 3)
+                handle_cookie_popup(page)
+                human_delay(1, 2)
+                outcome2 = _poll_until_outcome(page, "direct URL")
+                if outcome2 == "timeout":
+                    print("⚠️ Direct URL: timed out — saving debug")
+                    with open("blocked_debug.html", "w", encoding="utf-8") as f:
+                        f.write(page.content())
+                    save_final_screenshot(page, cn, "blocked_timeout_direct")
+                    browser.close()
+                    raise Exception("Blocked or DOM changed")
+                if _container_panel_visible(page):
+                    print("📦 Direct URL: tracking data present — parsing DOM …")
+                elif _visible_no_results_message(page):
+                    shot = save_final_screenshot(page, cn, "not_found")
+                    browser.close()
+                    return {
+                        "status": "not_found",
+                        "container_number": cn,
+                        "screenshot": shot,
+                    }
+                else:
+                    print("⚠️ Unexpected state after direct URL — saving debug")
+                    with open("blocked_debug.html", "w", encoding="utf-8") as f:
+                        f.write(page.content())
+                    save_final_screenshot(page, cn, "unexpected_state_direct")
+                    browser.close()
+                    raise Exception("Blocked or DOM changed")
             else:
                 print("⚠️ Unexpected state — saving debug")
                 with open("blocked_debug.html", "w", encoding="utf-8") as f:
                     f.write(page.content())
-                save_final_screenshot(page, container_no, "unexpected_state")
+                save_final_screenshot(page, cn, "unexpected_state")
                 browser.close()
                 raise Exception("Blocked or DOM changed")
 
@@ -332,7 +372,7 @@ def get_maersk_tracking(container_no: str, headless: bool = False):
             except:
                 pass
 
-            shot = save_final_screenshot(page, container_no, "success")
+            shot = save_final_screenshot(page, cn, "success")
             browser.close()
             print("✅ Maersk tracking finished (success)")
 
