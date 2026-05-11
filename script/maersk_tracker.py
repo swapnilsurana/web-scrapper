@@ -63,21 +63,44 @@ def _default_user_agent() -> str:
 
 
 def _visible_no_results_message(page) -> bool:
-    loc = page.get_by_text("No results found", exact=True)
-    for i in range(min(loc.count(), 15)):
-        try:
-            if loc.nth(i).is_visible():
-                return True
-        except Exception:
-            continue
+    candidates = [
+        "No results found",
+        "We couldn't find any Bills of Lading",
+        "not available on public track",
+    ]
+    for msg in candidates:
+        loc = page.get_by_text(msg, exact=False)
+        for i in range(min(loc.count(), 10)):
+            try:
+                if loc.nth(i).is_visible():
+                    return True
+            except Exception:
+                continue
     return False
 
 
 def _container_panel_visible(page) -> bool:
     try:
-        return page.locator('[data-test="container"]').first.is_visible()
+        if page.locator('[data-test="container"]').first.is_visible():
+            return True
+        if page.locator('[data-test="transport-plan"]').first.is_visible():
+            return True
+        if page.locator('[data-test="container-location"]').first.is_visible():
+            return True
+        if page.locator('[data-test="track-from-value"]').first.is_visible():
+            return True
+        return False
     except Exception:
         return False
+
+
+def _retry_sleep(attempt_idx: int) -> None:
+    # Attempt 0 => short, later attempts backoff more
+    base = 2 + attempt_idx * 4
+    jitter = random.uniform(0.5, 1.5)
+    secs = base + jitter
+    print(f"🔁 Backoff before retry: {secs:.1f}s")
+    time.sleep(secs)
 
 
 def _poll_until_outcome(page, phase: str) -> str:
@@ -216,68 +239,93 @@ def get_maersk_tracking(container_no: str, headless: bool = False):
             human_delay(1, 2)
             handle_cookie_popup(page)
             human_delay(0.5, 1)
-            submit_container_search(page, cn)
+            last_not_found_shot = None
+            for attempt in range(3):
+                if attempt > 0:
+                    _retry_sleep(attempt - 1)
+                    try:
+                        context.clear_cookies()
+                    except Exception:
+                        pass
+                    page.goto(TRACKING_PAGE_URL, timeout=60000)
+                    page.wait_for_load_state("domcontentloaded")
+                    human_delay(1, 2)
+                    handle_cookie_popup(page)
+                    human_delay(0.5, 1)
 
-            print("⏳ Initial settle after submit (3s) …")
-            time.sleep(3)
+                print(f"🔎 Attempt {attempt + 1}/3: submit via form")
+                submit_container_search(page, cn)
 
-            try:
-                outcome = _poll_until_outcome(page, "form submit")
-                if outcome == "timeout":
+                print("⏳ Initial settle after submit (3s) …")
+                time.sleep(3)
+
+                try:
+                    outcome = _poll_until_outcome(page, f"form submit attempt {attempt + 1}")
+                    if outcome == "timeout":
+                        print("⚠️ Failed to load expected content — saving debug")
+                        with open("blocked_debug.html", "w", encoding="utf-8") as f:
+                            f.write(page.content())
+                        raise Exception("Blocked or DOM changed")
+                except Exception:
                     print("⚠️ Failed to load expected content — saving debug")
                     with open("blocked_debug.html", "w", encoding="utf-8") as f:
                         f.write(page.content())
+                    save_final_screenshot(page, cn, f"blocked_timeout_a{attempt + 1}")
+                    browser.close()
                     raise Exception("Blocked or DOM changed")
-            except Exception:
-                print("⚠️ Failed to load expected content — saving debug")
-                with open("blocked_debug.html", "w", encoding="utf-8") as f:
-                    f.write(page.content())
-                save_final_screenshot(page, cn, "blocked_timeout")
-                browser.close()
-                raise Exception("Blocked or DOM changed")
 
-            if _container_panel_visible(page):
-                print("📦 Result: tracking data present — parsing DOM …")
-            elif _visible_no_results_message(page):
-                direct = _direct_tracking_url(cn)
-                print(f"↪️ Form returned no results — retrying direct URL: {direct}")
-                page.goto(direct, timeout=60000)
-                page.wait_for_load_state("domcontentloaded")
-                human_delay(2, 3)
-                handle_cookie_popup(page)
-                human_delay(1, 2)
-                outcome2 = _poll_until_outcome(page, "direct URL")
-                if outcome2 == "timeout":
-                    print("⚠️ Direct URL: timed out — saving debug")
-                    with open("blocked_debug.html", "w", encoding="utf-8") as f:
-                        f.write(page.content())
-                    save_final_screenshot(page, cn, "blocked_timeout_direct")
-                    browser.close()
-                    raise Exception("Blocked or DOM changed")
                 if _container_panel_visible(page):
-                    print("📦 Direct URL: tracking data present — parsing DOM …")
-                elif _visible_no_results_message(page):
-                    shot = save_final_screenshot(page, cn, "not_found")
-                    browser.close()
-                    return {
-                        "status": "not_found",
-                        "container_number": cn,
-                        "screenshot": shot,
-                    }
-                else:
+                    print("📦 Result: tracking data present — parsing DOM …")
+                    break
+
+                if _visible_no_results_message(page):
+                    direct = _direct_tracking_url(cn)
+                    print(f"↪️ Form returned no results — retrying direct URL: {direct}")
+                    page.goto(direct, timeout=60000)
+                    page.wait_for_load_state("domcontentloaded")
+                    human_delay(2, 3)
+                    handle_cookie_popup(page)
+                    human_delay(1, 2)
+                    outcome2 = _poll_until_outcome(page, f"direct URL attempt {attempt + 1}")
+                    if outcome2 == "timeout":
+                        print("⚠️ Direct URL: timed out — saving debug")
+                        with open("blocked_debug.html", "w", encoding="utf-8") as f:
+                            f.write(page.content())
+                        save_final_screenshot(page, cn, f"blocked_timeout_direct_a{attempt + 1}")
+                        browser.close()
+                        raise Exception("Blocked or DOM changed")
+
+                    if _container_panel_visible(page):
+                        print("📦 Direct URL: tracking data present — parsing DOM …")
+                        break
+
+                    if _visible_no_results_message(page):
+                        last_not_found_shot = save_final_screenshot(page, cn, f"not_found_a{attempt + 1}")
+                        print("ℹ️ Still not found after direct URL")
+                        continue
+
                     print("⚠️ Unexpected state after direct URL — saving debug")
                     with open("blocked_debug.html", "w", encoding="utf-8") as f:
                         f.write(page.content())
-                    save_final_screenshot(page, cn, "unexpected_state_direct")
+                    save_final_screenshot(page, cn, f"unexpected_state_direct_a{attempt + 1}")
                     browser.close()
                     raise Exception("Blocked or DOM changed")
-            else:
+
                 print("⚠️ Unexpected state — saving debug")
                 with open("blocked_debug.html", "w", encoding="utf-8") as f:
                     f.write(page.content())
-                save_final_screenshot(page, cn, "unexpected_state")
+                save_final_screenshot(page, cn, f"unexpected_state_a{attempt + 1}")
                 browser.close()
                 raise Exception("Blocked or DOM changed")
+
+            if not _container_panel_visible(page):
+                # All attempts exhausted
+                browser.close()
+                return {
+                    "status": "not_found",
+                    "container_number": cn,
+                    "screenshot": last_not_found_shot,
+                }
 
             container_number = None
             container_type = None
