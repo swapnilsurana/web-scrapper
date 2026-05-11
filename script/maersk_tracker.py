@@ -1,592 +1,247 @@
-"""
-Maersk container tracking scraper — GCP-safe version
-Uses undetected-chromedriver + optional residential proxy.
-
-Install deps:
-    pip install undetected-chromedriver selenium
-
-On GCP (headless display):
-    sudo apt-get install -y xvfb
-    Xvfb :99 -screen 0 1366x768x24 &
-    export DISPLAY=:99
-
-Proxy (residential — required on GCP to bypass IP blocks):
-    Set PROXY env var:  export PROXY="http://user:pass@host:port"
-    Or pass proxy= kwarg directly to get_maersk_tracking().
-"""
-
-import os
 import time
 import random
-import logging
-from typing import Optional
-
-import undetected_chromedriver as uc
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import (
-    ElementClickInterceptedException,
-    TimeoutException,
-    NoSuchElementException,
-)
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger(__name__)
-
-TRACKING_ROOT_URL = "https://www.maersk.com/tracking/"
-
-# Maersk tracking widgets render inside open shadow roots; Selenium must pierce them.
-_BOOKING_SELECT_SHADOW_JS = """
-    function findBookingSelect(root) {
-      if (!root) return null;
-      if (root.querySelectorAll) {
-        var sels = root.querySelectorAll("select");
-        for (var i = 0; i < sels.length; i++) {
-          var s = sels[i], hasO = false, hasA = false;
-          for (var j = 0; j < s.options.length; j++) {
-            var v = s.options[j].value;
-            if (v === "ocean") hasO = true;
-            if (v === "air") hasA = true;
-          }
-          if (hasO && hasA) return s;
-        }
-      }
-      if (root.querySelectorAll) {
-        var nodes = root.querySelectorAll("*");
-        for (var k = 0; k < nodes.length; k++) {
-          var n = nodes[k];
-          if (n.shadowRoot) {
-            var f = findBookingSelect(n.shadowRoot);
-            if (f) return f;
-          }
-        }
-      }
-      return null;
-    }
-    var sel = findBookingSelect(document);
-    if (!sel) return false;
-    sel.value = "air";
-    sel.dispatchEvent(new Event("input", { bubbles: true }));
-    sel.dispatchEvent(new Event("change", { bubbles: true }));
-    sel.value = "ocean";
-    sel.dispatchEvent(new Event("input", { bubbles: true }));
-    sel.dispatchEvent(new Event("change", { bubbles: true }));
-    return true;
-"""
-
-_TRACKING_INPUT_SHADOW_JS = """
-    function findInput(root) {
-      if (!root) return null;
-      var patterns = [
-        'input[placeholder="BL or container number"]',
-        'input[placeholder*="BL or container"]',
-        'input[placeholder*="container number"]'
-      ];
-      for (var p = 0; p < patterns.length; p++) {
-        try {
-          var el = root.querySelector(patterns[p]);
-          if (el) return el;
-        } catch (e) {}
-      }
-      if (root.querySelectorAll) {
-        var nodes = root.querySelectorAll("*");
-        for (var i = 0; i < nodes.length; i++) {
-          if (nodes[i].shadowRoot) {
-            var hit = findInput(nodes[i].shadowRoot);
-            if (hit) return hit;
-          }
-        }
-      }
-      return null;
-    }
-    return findInput(document);
-"""
+from playwright.sync_api import sync_playwright
+from xvfbwrapper import Xvfb
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _delay(lo: float = 1.5, hi: float = 3.5) -> None:
-    time.sleep(random.uniform(lo, hi))
+def human_delay(a=1.5, b=3.5):
+    time.sleep(random.uniform(a, b))
 
 
-def _build_driver(proxy: Optional[str] = None) -> uc.Chrome:
-    """
-    Build an undetected Chrome driver.
-    proxy format:
-        http://user:pass@host:port
-        socks5://user:pass@host:port
-    """
-
-    options = uc.ChromeOptions()
-
-    # ─────────────────────────────────────────────────────────────
-    # Basic browser settings
-    # ─────────────────────────────────────────────────────────────
-    options.add_argument("--window-size=1366,768")
-    options.add_argument("--lang=en-US")
-    options.add_argument("--start-maximized")
-
-    # ─────────────────────────────────────────────────────────────
-    # Required for VPS / Docker / GCP
-    # ─────────────────────────────────────────────────────────────
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--disable-extensions")
-    options.add_argument("--disable-infobars")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-
-    # ─────────────────────────────────────────────────────────────
-    # Stability fixes
-    # ─────────────────────────────────────────────────────────────
-    options.add_argument("--remote-debugging-port=9222")
-    options.add_argument("--disable-setuid-sandbox")
-    options.add_argument("--disable-software-rasterizer")
-    options.add_argument("--disable-features=VizDisplayCompositor")
-
-    # ─────────────────────────────────────────────────────────────
-    # User-Agent
-    # ─────────────────────────────────────────────────────────────
-    options.add_argument(
-        "--user-agent=Mozilla/5.0 (X11; Linux x86_64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/136.0.0.0 Safari/537.36"
-    )
-
-    # ─────────────────────────────────────────────────────────────
-    # Proxy
-    # ─────────────────────────────────────────────────────────────
-    if proxy:
-        options.add_argument(f"--proxy-server={proxy}")
-        log.info("🔀 Proxy enabled")
-
-    # ─────────────────────────────────────────────────────────────
-    # Chrome binary detection
-    # ─────────────────────────────────────────────────────────────
-    possible_paths = [
-        "/usr/bin/google-chrome",
-        "/usr/bin/google-chrome-stable",
-        "/usr/bin/chromium-browser",
-        "/usr/bin/chromium",
-    ]
-
-    for path in possible_paths:
-        if os.path.exists(path):
-            options.binary_location = path
-            log.info(f"✅ Chrome binary: {path}")
-            break
-
-    # ─────────────────────────────────────────────────────────────
-    # Launch driver
-    # IMPORTANT:
-    # DO NOT hardcode version_main
-    # ─────────────────────────────────────────────────────────────
-    driver = uc.Chrome(
-        options=options,
-        headless=False,
-        use_subprocess=False,
-        version_main=146,
-    )
-
-    # ─────────────────────────────────────────────────────────────
-    # Extra stealth patches
-    # ─────────────────────────────────────────────────────────────
-    driver.execute_cdp_cmd(
-        "Page.addScriptToEvaluateOnNewDocument",
-        {
-            "source": """
-                Object.defineProperty(navigator, 'webdriver', {
-                    get: () => undefined
-                });
-
-                Object.defineProperty(navigator, 'languages', {
-                    get: () => ['en-US', 'en']
-                });
-
-                Object.defineProperty(navigator, 'plugins', {
-                    get: () => [1,2,3,4,5]
-                });
-
-                window.chrome = {
-                    runtime: {}
-                };
-            """
-        },
-    )
-
-    return driver
-
-def _accept_cookies(driver: uc.Chrome) -> None:
-    """Dismiss Cookie Information / Maersk cookie UI if present."""
-    selectors = [
-        "//*[@id='coiOverlay']//button[contains(., 'Allow all')]",
-        "//*[@id='coiOverlay']//button[contains(., 'Accept all')]",
-        "//*[@id='coiBanner']//button[contains(., 'Allow all')]",
-        "//button[contains(., 'Allow all')]",
-        "//button[contains(., 'Accept')]",
-    ]
-    for xpath in selectors:
-        try:
-            btn = WebDriverWait(driver, 6).until(
-                EC.element_to_be_clickable((By.XPATH, xpath))
-            )
-            btn.click()
-            log.info("✅ Cookie banner dismissed")
-            _delay(0.5, 1.0)
-            return
-        except TimeoutException:
-            continue
-
-    # Check iframes
-    for frame in driver.find_elements(By.TAG_NAME, "iframe"):
-        try:
-            driver.switch_to.frame(frame)
-            for xpath in selectors:
-                try:
-                    btn = driver.find_element(By.XPATH, xpath)
-                    btn.click()
-                    log.info("✅ Cookie banner dismissed (iframe)")
-                    driver.switch_to.default_content()
-                    _delay(0.5, 1.0)
-                    return
-                except NoSuchElementException:
-                    continue
-        except Exception:
-            pass
-        finally:
-            driver.switch_to.default_content()
-
-    # Cookie Information script sometimes renders buttons Selenium cannot reach
+def handle_cookie_popup(page):
     try:
-        clicked = driver.execute_script(
-            """
-            var ov = document.getElementById('coiOverlay');
-            if (!ov) return false;
-            var labels = ['Allow all', 'Accept all', 'Accept'];
-            var buttons = ov.querySelectorAll('button');
-            for (var i = 0; i < buttons.length; i++) {
-              var t = (buttons[i].innerText || '').trim();
-              for (var j = 0; j < labels.length; j++) {
-                if (t.indexOf(labels[j]) !== -1) {
-                  buttons[i].click();
-                  return true;
-                }
-              }
-            }
-            return false;
-            """
-        )
-        if clicked:
-            log.info("✅ Cookie overlay dismissed (script)")
-            _delay(0.5, 1.0)
-            return
-    except Exception:
-        pass
-
-    log.info("ℹ️  No cookie banner found")
-
-
-def _select_ocean_type(driver: uc.Chrome) -> None:
-    """
-    The tracking widget has a booking-type selector. Cycle air→ocean to ensure
-    the correct search mode is active (mirrors maersk_tracker.py / live DOM).
-    """
-    wait = WebDriverWait(driver, 20)
-
-    # Try native <select> first (scope to the tracking widget, not lang/footer selects)
-    try:
-        from selenium.webdriver.support.ui import Select
-        sel_el = wait.until(
-            EC.presence_of_element_located(
-                (
-                    By.XPATH,
-                    "//select[.//option[@value='ocean'] and .//option[@value='air']]",
-                )
-            )
-        )
-        sel = Select(sel_el)
-        sel.select_by_value("air")
-        _delay(0.4, 0.8)
-        sel.select_by_value("ocean")
+        page.wait_for_selector('button:has-text("Allow all")', timeout=6000)
+        page.click('button:has-text("Allow all")')
+        print("✅ Cookie accepted")
         return
-    except Exception:
+    except:
         pass
 
-    # Native <select> inside shadow roots (common for mc-* components)
-    try:
-        if driver.execute_script(_BOOKING_SELECT_SHADOW_JS):
-            return
-    except Exception:
-        pass
-
-    # Fallback: custom combobox — options are labelled "Air cargo" / "Ocean cargo"
-    try:
-        combos = driver.find_elements(By.CSS_SELECTOR, "[role='combobox']")
-        combo = next((c for c in combos if c.is_displayed()), None)
-        if combo is None:
-            combo = wait.until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, "[role='combobox']"))
-            )
-        combo.click()
-        _delay(0.3, 0.6)
-        driver.find_element(
-            By.XPATH, "//*[@role='option'][contains(.,'Air cargo')]"
-        ).click()
-        _delay(0.4, 0.8)
-        combo.click()
-        _delay(0.3, 0.6)
-        driver.find_element(
-            By.XPATH, "//*[@role='option'][contains(.,'Ocean cargo')]"
-        ).click()
-    except Exception as exc:
-        log.warning("Could not set booking type: %s", exc)
-    finally:
+    for frame in page.frames:
         try:
-            driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+            btn = frame.locator('button:has-text("Allow all")')
+            if btn.count() > 0:
+                btn.click()
+                print("✅ Cookie accepted (iframe)")
+                return
+        except:
+            pass
+
+    print("ℹ️ No cookie popup found")
+
+
+def get_maersk_tracking(container_no: str, headless: bool = False):
+    # with Xvfb(width=1366, height=768, colordepth=24) as xvfb:
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=headless,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ]
+        )
+
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/123.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1366, "height": 768},
+            locale="en-US",
+            timezone_id="Asia/Kolkata",
+        )
+
+        page = context.new_page()
+
+        # 🛡️ Stealth
+        page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined
+            });
+        """)
+
+        print("🔄 Opening Maersk homepage…")
+        page.goto("https://www.maersk.com/", timeout=60000)
+        page.wait_for_load_state("domcontentloaded")
+        human_delay(3, 5)
+
+        handle_cookie_popup(page)
+        human_delay(2, 3)
+
+        page.mouse.move(200, 200)
+        human_delay(1, 2)
+
+        # Hero tracking widget (not /tracking/{id}): Tracking tab + field + Track
+        try:
+            tab = page.get_by_role("button", name="Tracking", exact=True).first
+            tab.wait_for(state="visible", timeout=10000)
+            tab.click()
+            human_delay(0.5, 1.0)
         except Exception:
             pass
-        _delay(0.2, 0.4)
 
+        input_el = page.get_by_placeholder("B/L, container number or parcel")
+        input_el.wait_for(state="visible", timeout=20000)
+        input_el.click()
+        human_delay(0.2, 0.5)
+        input_el.fill(container_no)
+        human_delay(0.5, 1.0)
 
-def _find_tracking_input(driver: uc.Chrome, wait: WebDriverWait):
-    """Resolve the BL/container field (light DOM or open shadow roots)."""
-    locators = [
-        (By.XPATH, "//*[@placeholder='BL or container number']"),
-        (By.CSS_SELECTOR, 'input[placeholder*="BL or container"]'),
-        (By.CSS_SELECTOR, 'input[placeholder*="container number"]'),
-    ]
-    last_exc: Optional[Exception] = None
-    for by, selector in locators:
-        try:
-            return wait.until(EC.presence_of_element_located((by, selector)))
-        except TimeoutException as exc:
-            last_exc = exc
-            continue
-    try:
-        return wait.until(lambda d: d.execute_script(_TRACKING_INPUT_SHADOW_JS))
-    except TimeoutException as exc:
-        raise TimeoutException("Could not find tracking input") from exc
-
-
-def _wait_for_results(driver: uc.Chrome, timeout: int = 25) -> bool:
-    """
-    Poll until container card OR 'No results found' appears.
-    Returns True if something loaded, False if timed out.
-    """
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if driver.find_elements(By.CSS_SELECTOR, '[data-test="container"]'):
-            return True
-        if driver.find_elements(By.XPATH, "//*[contains(text(),'No results found')]"):
-            return True
-        time.sleep(1)
-    return False
-
-
-def _safe_text(driver: uc.Chrome, css: str, index: int = 0) -> Optional[str]:
-    els = driver.find_elements(By.CSS_SELECTOR, css)
-    if len(els) > index:
-        txt = els[index].get_attribute("innerText") or els[index].text
-        return txt.strip() or None
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-def get_maersk_tracking(
-    container_no: str,
-    proxy: Optional[str] = None,
-) -> dict:
-    """
-    Fetch Maersk tracking data for a container / BL number.
-
-    Args:
-        container_no:  e.g. "MRKU0580031"
-        proxy:         Residential proxy URI — strongly recommended on cloud VMs.
-                       Falls back to PROXY env var if not provided.
-                       Format: "http://user:pass@host:port"
-    Returns:
-        dict with status, container info, POL/POD, events list.
-    """
-    proxy = proxy or os.getenv("PROXY")
-
-    driver = _build_driver(proxy=proxy)
-
-    try:
-        # ── Warm-up: visit homepage first to look organic ───────────────────
-        log.info("🔄 Session warm-up: maersk.com")
-        driver.get("https://www.maersk.com/")
-        WebDriverWait(driver, 60).until(
-            lambda d: d.execute_script("return document.readyState") == "complete"
+        track_btn = page.locator(
+            '[data-test="track-button"], button[data-track-button="track"]'
         )
-        _delay(3, 5)
-        _accept_cookies(driver)
-        _delay(1, 2)
+        if track_btn.count() == 0:
+            track_btn = page.get_by_role("button", name="Track", exact=True)
+        track_btn.first.click()
 
-        # Subtle mouse-like scroll
-        driver.execute_script("window.scrollBy(0, 300)")
-        _delay(1, 2)
+        print(f"🔍 Tracking {container_no} …")
+        human_delay(2, 4)
+        time.sleep(3)
 
-        # ── Navigate to tracking ────────────────────────────────────────────
-        log.info("🚢 Opening tracking page")
-        driver.get(TRACKING_ROOT_URL)
-        WebDriverWait(driver, 60).until(
-            lambda d: d.execute_script("return document.readyState") == "complete"
-        )
-        _delay(2, 4)
-        _accept_cookies(driver)
-        _delay(1, 2)
-
-        # ── Set booking type ────────────────────────────────────────────────
-        _select_ocean_type(driver)
-        _delay(0.8, 1.5)
-
-        # ── Type container number ───────────────────────────────────────────
-        wait = WebDriverWait(driver, 20)
-        inp = _find_tracking_input(driver, wait)
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", inp)
-        _delay(0.2, 0.5)
         try:
-            inp.click()
-        except Exception:
-            driver.execute_script("arguments[0].click();", inp)
-        _delay(0.3, 0.7)
-        # Type character-by-character to mimic human input
-        for ch in container_no:
-            inp.send_keys(ch)
-            time.sleep(random.uniform(0.05, 0.15))
-        _delay(0.5, 1.0)
+            found = False
+            for _ in range(20):
+                if page.locator('[data-test="container"]').first.is_visible():
+                    found = True
+                    break
+                if page.locator("text=No results found").first.is_visible():
+                    found = True
+                    break
+                time.sleep(1)
 
-        # ── Click Track ─────────────────────────────────────────────────────
-        track_btn = wait.until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, '[data-test="track-button"]'))
-        )
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", track_btn)
-        _delay(0.2, 0.5)
-        _accept_cookies(driver)
-        _delay(0.3, 0.6)
-        try:
-            track_btn.click()
-        except ElementClickInterceptedException:
-            _accept_cookies(driver)
-            _delay(0.3, 0.6)
-            try:
-                track_btn.click()
-            except ElementClickInterceptedException:
-                driver.execute_script(
-                    """
-                    var o = document.getElementById('coiOverlay');
-                    if (o) { o.style.display = 'none'; }
-                    """,
-                )
-                driver.execute_script("arguments[0].click();", track_btn)
-        log.info("🔍 Tracking %s …", container_no)
+            if not found:
+                print("⚠️ Failed to load expected content — saving debug")
+                with open("blocked_debug.html", "w", encoding="utf-8") as f:
+                    f.write(page.content())
+                raise Exception("Blocked or DOM changed")
+        except:
+            print("⚠️ Failed to load expected content — saving debug")
+            with open("blocked_debug.html", "w", encoding="utf-8") as f:
+                f.write(page.content())
+            browser.close()
+            raise Exception("Blocked or DOM changed")
 
-        # ── Wait for results ─────────────────────────────────────────────────
-        loaded = _wait_for_results(driver)
-        if not loaded:
-            with open("blocked_debug.html", "w", encoding="utf-8") as fh:
-                fh.write(driver.page_source)
-            raise RuntimeError(
-                "Timed out waiting for results — page saved to blocked_debug.html. "
-                "Most likely cause: IP blocked. Try a residential proxy."
-            )
-
-        # ── No results ───────────────────────────────────────────────────────
-        if driver.find_elements(By.XPATH, "//*[contains(text(),'No results found')]"):
+        if page.locator("text=No results found").count() > 0:
+            browser.close()
             return {"status": "not_found", "container_number": container_no}
 
-        # ── Parse results ────────────────────────────────────────────────────
-        result: dict = {"status": "success"}
-
-        result["Port of Loading (POL)"]  = _safe_text(driver, '[data-test="track-from-value"]')
-        result["Port of Discharge (POD)"] = _safe_text(driver, '[data-test="track-to-value"]')
-
-        # Container number + type from header spans
-        try:
-            spans = driver.find_elements(
-                By.CSS_SELECTOR,
-                '[data-test="container"] header mc-text-and-icon:first-child span',
-            )
-            result["container_number"] = spans[0].text.strip() if len(spans) > 0 else None
-            result["container_type"]   = spans[2].text.strip() if len(spans) > 2 else None
-        except Exception:
-            result["container_number"] = None
-            result["container_type"]   = None
-
-        # Last updated
-        try:
-            lu = driver.find_element(By.CSS_SELECTOR, '[data-test="last-updated"]')
-            result["last_updated"] = lu.text.strip() or None
-        except NoSuchElementException:
-            result["last_updated"] = None
-
-        # ETA
-        result["eta"] = _safe_text(driver, '[data-test="container-eta"] span.labels slot', index=1)
-
-        # Latest event / location
-        result["latest_event"] = _safe_text(
-            driver, '[data-test="container-location"] [slot="sublabel"]'
-        )
-
-        # Transport plan events
+        container_number = None
+        container_type = None
+        last_updated = None
+        eta = None
+        latest_event = None
+        pol = None
+        pod = None
         events = []
+
         try:
-            items = driver.find_elements(
-                By.CSS_SELECTOR,
-                '[data-test="transport-plan"] li.transport-plan__list__item',
-            )
-            for item in items:
-                location_name = location_terminal = milestone_name = milestone_date = None
+            from_el = page.locator('[data-test="track-from-value"]').first
+            if from_el.count() > 0:
+                pol = from_el.inner_text().strip() or None
+        except:
+            pass
+
+        try:
+            to_el = page.locator('[data-test="track-to-value"]').first
+            if to_el.count() > 0:
+                pod = to_el.inner_text().strip() or None
+        except:
+            pass
+
+        try:
+            header = page.locator('[data-test="container"] header')
+            txt_icons = header.locator("mc-text-and-icon")
+
+            if txt_icons.count() > 0:
+                spans = txt_icons.nth(0).locator("span")
+                if spans.count() >= 3:
+                    container_number = spans.nth(0).inner_text().strip()
+                    container_type = spans.nth(2).inner_text().strip()
+
+            if txt_icons.count() > 1:
+                last_updated_el = txt_icons.nth(1).locator('[data-test="last-updated"]')
+                if last_updated_el.count() > 0:
+                    last_updated = last_updated_el.inner_text().strip()
+        except:
+            pass
+
+        try:
+            eta_el = page.locator('[data-test="container-eta"] span.labels slot').nth(1)
+            if eta_el.count() > 0:
+                eta = eta_el.inner_text().strip()
+        except:
+            pass
+
+        try:
+            latest_event_el = page.locator('[data-test="container-location"] [slot="sublabel"]')
+            if latest_event_el.count() > 0:
+                latest_event = latest_event_el.inner_text().strip()
+        except:
+            pass
+
+        try:
+            items = page.locator('[data-test="transport-plan"] li.transport-plan__list__item')
+            for i in range(items.count()):
+                item = items.nth(i)
+                location_name = None
+                location_terminal = None
+                milestone_name = None
+                milestone_date = None
 
                 try:
-                    strong = item.find_element(By.CSS_SELECTOR, ".location strong")
-                    location_name = strong.text.strip()
-                    full_text = item.find_element(By.CSS_SELECTOR, ".location").text.strip()
-                    location_terminal = full_text.replace(location_name, "").strip() or None
-                except NoSuchElementException:
+                    strong = item.locator(".location strong")
+                    if strong.count() > 0:
+                        location_name = strong.inner_text().strip()
+                        full_text = item.locator(".location").inner_text().strip()
+                        location_terminal = full_text.replace(location_name, "").strip()
+                except:
                     pass
 
                 try:
-                    ms = item.find_element(By.CSS_SELECTOR, '[data-test="milestone"]')
-                    spans = ms.find_elements(By.TAG_NAME, "span")
-                    if spans:
-                        milestone_name = spans[0].text.strip()
-                    date_el = ms.find_elements(By.CSS_SELECTOR, '[data-test="milestone-date"]')
-                    if date_el:
-                        milestone_date = date_el[0].text.strip()
-                except NoSuchElementException:
+                    milestone = item.locator('[data-test="milestone"]')
+                    if milestone.count() > 0:
+                        spans = milestone.locator("span")
+                        if spans.count() > 0:
+                            milestone_name = spans.nth(0).inner_text().strip()
+                        date_el = milestone.locator('[data-test="milestone-date"]')
+                        if date_el.count() > 0:
+                            milestone_date = date_el.inner_text().strip()
+                except:
                     pass
 
                 events.append({
-                    "location_name":     location_name,
+                    "location_name": location_name,
                     "location_terminal": location_terminal,
-                    "event":             milestone_name,
-                    "date_time":         milestone_date,
+                    "event": milestone_name,
+                    "date_time": milestone_date,
                 })
-        except Exception as exc:
-            log.warning("Event parsing error: %s", exc)
+        except:
+            pass
 
-        result["events"] = events
-        return result
+        browser.close()
 
-    finally:
-        driver.quit()
+        return {
+            "status": "success",
+            "container_number": container_number,
+            "container_type": container_type,
+            "last_updated": last_updated,
+            "eta": eta,
+            "latest_event": latest_event,
+            "Port of Loading (POL)": pol,
+            "Port of Discharge (POD)": pod,
+            "events": events,
+        }
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
+# -------------------------------
+# 🧪 RUN
+# -------------------------------
 if __name__ == "__main__":
     from pprint import pprint
 
-    # Set your residential proxy here or via env:  export PROXY="http://user:pass@host:port"
-    result = get_maersk_tracking("MSKU1236969")
+    container_id = "MRKU0580031"
+    result = get_maersk_tracking(container_id, headless=False)
+
     pprint(result)

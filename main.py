@@ -4,7 +4,7 @@ from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-from script.maersk_tracker import get_maersk_tracking
+from script.maersk_tracking_test import track_maersk_visiwise
 from script.msc_tracker import get_msc_tracking
 from script.cmacgm_tracker import get_cmacgm_tracking
 from script.cosco_tracker import get_cosco_tracking
@@ -20,7 +20,7 @@ load_dotenv()
 API_KEY = os.getenv("API_KEY", "changeme")
 
 CARRIERS = {
-    "maersk": get_maersk_tracking,
+    "maersk": track_maersk_visiwise,
     "msc": get_msc_tracking,
     "cmacgm": get_cmacgm_tracking,
     "cosco": get_cosco_tracking,
