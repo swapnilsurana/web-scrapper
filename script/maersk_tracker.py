@@ -116,52 +116,109 @@ def _delay(lo: float = 1.5, hi: float = 3.5) -> None:
 def _build_driver(proxy: Optional[str] = None) -> uc.Chrome:
     """
     Build an undetected Chrome driver.
-    proxy format:  "http://user:pass@host:port"
-                   "socks5://user:pass@host:port"
+    proxy format:
+        http://user:pass@host:port
+        socks5://user:pass@host:port
     """
+
     options = uc.ChromeOptions()
 
-    # ── Viewport / locale ──────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────
+    # Basic browser settings
+    # ─────────────────────────────────────────────────────────────
     options.add_argument("--window-size=1366,768")
     options.add_argument("--lang=en-US")
+    options.add_argument("--start-maximized")
 
-    # ── Sandbox / shared-mem (required on GCP / Docker) ────────────────────
+    # ─────────────────────────────────────────────────────────────
+    # Required for VPS / Docker / GCP
+    # ─────────────────────────────────────────────────────────────
+    options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-infobars")
+    options.add_argument("--disable-blink-features=AutomationControlled")
 
-    # ── Proxy ──────────────────────────────────────────────────────────────
-    # if proxy:
-    #     options.add_argument(f"--proxy-server={proxy}")
-    #     log.info("🔀 Proxy enabled: %s", proxy.split("@")[-1])  # hide creds in log
-    # else:
-    #     log.warning(
-    #         "⚠️  No proxy configured. GCP datacenter IPs are commonly blocked by "
-    #         "Cloudflare. Set PROXY env var or pass proxy= kwarg."
-    #     )
+    # ─────────────────────────────────────────────────────────────
+    # Stability fixes
+    # ─────────────────────────────────────────────────────────────
+    options.add_argument("--remote-debugging-port=9222")
+    options.add_argument("--disable-setuid-sandbox")
+    options.add_argument("--disable-software-rasterizer")
+    options.add_argument("--disable-features=VizDisplayCompositor")
 
-    # ── undetected-chromedriver patches Chrome binary automatically ─────────
-    driver = uc.Chrome(
-        options=options,
-        use_subprocess=True,   # isolates each session in its own process
-        version_main=146,     # auto-detect installed Chrome version
+    # ─────────────────────────────────────────────────────────────
+    # User-Agent
+    # ─────────────────────────────────────────────────────────────
+    options.add_argument(
+        "--user-agent=Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/136.0.0.0 Safari/537.36"
     )
 
-    # Extra JS stealth patches on top of what uc already does
+    # ─────────────────────────────────────────────────────────────
+    # Proxy
+    # ─────────────────────────────────────────────────────────────
+    if proxy:
+        options.add_argument(f"--proxy-server={proxy}")
+        log.info("🔀 Proxy enabled")
+
+    # ─────────────────────────────────────────────────────────────
+    # Chrome binary detection
+    # ─────────────────────────────────────────────────────────────
+    possible_paths = [
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/chromium",
+    ]
+
+    for path in possible_paths:
+        if os.path.exists(path):
+            options.binary_location = path
+            log.info(f"✅ Chrome binary: {path}")
+            break
+
+    # ─────────────────────────────────────────────────────────────
+    # Launch driver
+    # IMPORTANT:
+    # DO NOT hardcode version_main
+    # ─────────────────────────────────────────────────────────────
+    driver = uc.Chrome(
+        options=options,
+        headless=True,
+        use_subprocess=False,
+    )
+
+    # ─────────────────────────────────────────────────────────────
+    # Extra stealth patches
+    # ─────────────────────────────────────────────────────────────
     driver.execute_cdp_cmd(
         "Page.addScriptToEvaluateOnNewDocument",
         {
             "source": """
-                // Remove leftover automation markers
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-                Object.defineProperty(navigator, 'plugins',   { get: () => [1, 2, 3, 4, 5] });
-                window.chrome = { runtime: {} };
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                });
+
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['en-US', 'en']
+                });
+
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [1,2,3,4,5]
+                });
+
+                window.chrome = {
+                    runtime: {}
+                };
             """
         },
     )
 
     return driver
-
 
 def _accept_cookies(driver: uc.Chrome) -> None:
     """Dismiss Cookie Information / Maersk cookie UI if present."""
