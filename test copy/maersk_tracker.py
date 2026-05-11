@@ -84,8 +84,42 @@ def save_final_screenshot(page, container_no: str, label: str) -> str:
     return str(path)
 
 
+def _tracking_booking_combobox(page):
+    return page.get_by_role("combobox").first
+
+
+def _set_booking_type(page, value: str, display_name: str) -> None:
+    combo = _tracking_booking_combobox(page)
+    combo.wait_for(state="visible", timeout=20000)
+    combo.scroll_into_view_if_needed()
+    human_delay(0.15, 0.35)
+    print(f"📋 Booking type → {display_name!r} (value={value!r})")
+    try:
+        combo.select_option(value=value, timeout=8000)
+    except Exception:
+        combo.click()
+        human_delay(0.25, 0.45)
+        lb = page.get_by_role("listbox")
+        if lb.count() > 0:
+            opt = lb.first.get_by_role("option", name=display_name)
+        else:
+            opt = page.get_by_role("option", name=display_name)
+        if opt.count() == 0:
+            opt = page.get_by_text(display_name, exact=True)
+        opt.first.click()
+    human_delay(0.35, 0.65)
+
+
+def cycle_air_then_ocean_booking_type(page) -> None:
+    """Maersk UI: briefly switch to Air cargo, then back to Ocean before container search."""
+    print("📋 Cycling booking dropdown: Air cargo → Ocean cargo")
+    _set_booking_type(page, "air", "Air cargo")
+    _set_booking_type(page, "ocean", "Ocean cargo")
+
+
 def submit_container_search(page, container_no: str):
-    print(f"⌨️  Focusing search field (container will be entered next)")
+    cycle_air_then_ocean_booking_type(page)
+    print("⌨️  Focusing search field (container will be entered next)")
     search = page.get_by_placeholder("BL or container number")
     search.wait_for(state="visible", timeout=20000)
     search.scroll_into_view_if_needed()
