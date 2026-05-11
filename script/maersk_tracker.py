@@ -133,7 +133,6 @@ def _build_driver(proxy: Optional[str] = None) -> uc.Chrome:
     # ─────────────────────────────────────────────────────────────
     # Required for VPS / Docker / GCP
     # ─────────────────────────────────────────────────────────────
-    options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
@@ -188,7 +187,7 @@ def _build_driver(proxy: Optional[str] = None) -> uc.Chrome:
     # ─────────────────────────────────────────────────────────────
     driver = uc.Chrome(
         options=options,
-        headless=True,
+        headless=False,
         use_subprocess=False,
         version_main=146,
     )
