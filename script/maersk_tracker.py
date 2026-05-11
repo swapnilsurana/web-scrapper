@@ -1,3 +1,4 @@
+import sys
 import time
 import random
 from playwright.sync_api import sync_playwright
@@ -33,13 +34,53 @@ def handle_cookie_popup(page):
 TRACKING_PAGE_URL = "https://www.maersk.com/tracking/"
 
 
+def _default_user_agent() -> str:
+    if sys.platform == "darwin":
+        return (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/123.0.0.0 Safari/537.36"
+        )
+    return (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/123.0.0.0 Safari/537.36"
+    )
+
+
+def _visible_no_results_message(page) -> bool:
+    loc = page.get_by_text("No results found", exact=True)
+    for i in range(min(loc.count(), 15)):
+        try:
+            if loc.nth(i).is_visible():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _container_panel_visible(page) -> bool:
+    try:
+        return page.locator('[data-test="container"]').first.is_visible()
+    except Exception:
+        return False
+
+
 def submit_container_search(page, container_no: str):
     search = page.get_by_placeholder("BL or container number")
     search.wait_for(state="visible", timeout=20000)
-    human_delay(0.3, 0.7)
+    search.scroll_into_view_if_needed()
+    human_delay(0.2, 0.5)
+    search.click()
+    human_delay(0.1, 0.3)
+    search.clear()
+    human_delay(0.1, 0.2)
     search.fill(container_no)
     human_delay(0.3, 0.6)
     page.get_by_role("button", name="Track").first.click()
+    try:
+        page.wait_for_load_state("networkidle", timeout=30000)
+    except Exception:
+        pass
 
 
 def get_maersk_tracking(container_no: str, headless: bool = False):
@@ -55,11 +96,7 @@ def get_maersk_tracking(container_no: str, headless: bool = False):
             )
 
             context = browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/123.0.0.0 Safari/537.36"
-                ),
+                user_agent=_default_user_agent(),
                 viewport={"width": 1366, "height": 768},
                 locale="en-US",
                 timezone_id="Asia/Kolkata",
@@ -74,16 +111,16 @@ def get_maersk_tracking(container_no: str, headless: bool = False):
                 });
             """)
 
-            # print("🔄 Session warm-up...")
-            # page.goto("https://www.maersk.com/", timeout=60000)
-            # page.wait_for_load_state("domcontentloaded")
-            # human_delay(3, 5)
+            print("🔄 Session warm-up...")
+            page.goto("https://www.maersk.com/", timeout=60000)
+            page.wait_for_load_state("domcontentloaded")
+            human_delay(3, 5)
 
-            # handle_cookie_popup(page)
-            # human_delay(2, 3)
+            handle_cookie_popup(page)
+            human_delay(2, 3)
 
-            # page.mouse.move(200, 200)
-            # human_delay(1, 2)
+            page.mouse.move(200, 200)
+            human_delay(1, 2)
 
             print(f"🚢 Opening tracking page: {TRACKING_PAGE_URL}")
             page.goto(TRACKING_PAGE_URL, timeout=60000)
@@ -93,15 +130,15 @@ def get_maersk_tracking(container_no: str, headless: bool = False):
             human_delay(0.5, 1)
             submit_container_search(page, container_no)
 
-            time.sleep(5)
+            time.sleep(3)
 
             try:
                 found = False
-                for _ in range(20):
-                    if page.locator('[data-test="container"]').first.is_visible():
+                for _ in range(45):
+                    if _container_panel_visible(page):
                         found = True
                         break
-                    if page.locator("text=No results found").first.is_visible():
+                    if _visible_no_results_message(page):
                         found = True
                         break
                     time.sleep(1)
@@ -111,16 +148,24 @@ def get_maersk_tracking(container_no: str, headless: bool = False):
                     with open("blocked_debug.html", "w", encoding="utf-8") as f:
                         f.write(page.content())
                     raise Exception("Blocked or DOM changed")
-            except:
+            except Exception:
                 print("⚠️ Failed to load expected content — saving debug")
                 with open("blocked_debug.html", "w", encoding="utf-8") as f:
                     f.write(page.content())
                 browser.close()
                 raise Exception("Blocked or DOM changed")
 
-            if page.locator("text=No results found").count() > 0:
+            if _container_panel_visible(page):
+                pass
+            elif _visible_no_results_message(page):
                 browser.close()
                 return {"status": "not_found", "container_number": container_no}
+            else:
+                print("⚠️ Unexpected state — saving debug")
+                with open("blocked_debug.html", "w", encoding="utf-8") as f:
+                    f.write(page.content())
+                browser.close()
+                raise Exception("Blocked or DOM changed")
 
             container_number = None
             container_type = None
