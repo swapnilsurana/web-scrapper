@@ -30,9 +30,19 @@ def handle_cookie_popup(page):
     print("ℹ️ No cookie popup found")
 
 
-def get_maersk_tracking(container_no: str, headless: bool = False):
-    url = f"https://www.maersk.com/tracking/{container_no}"
+TRACKING_PAGE_URL = "https://www.maersk.com/tracking/"
 
+
+def submit_container_search(page, container_no: str):
+    search = page.get_by_placeholder("BL or container number")
+    search.wait_for(state="visible", timeout=20000)
+    human_delay(0.3, 0.7)
+    search.fill(container_no)
+    human_delay(0.3, 0.6)
+    page.get_by_role("button", name="Track").first.click()
+
+
+def get_maersk_tracking(container_no: str, headless: bool = False):
     with Xvfb(width=1366, height=768, colordepth=24) as xvfb:
         with sync_playwright() as p:
             browser = p.chromium.launch(
@@ -75,8 +85,13 @@ def get_maersk_tracking(container_no: str, headless: bool = False):
             page.mouse.move(200, 200)
             human_delay(1, 2)
 
-            print(f"🚢 Opening tracking: {url}")
-            page.goto(url, timeout=60000)
+            print(f"🚢 Opening tracking page: {TRACKING_PAGE_URL}")
+            page.goto(TRACKING_PAGE_URL, timeout=60000)
+            page.wait_for_load_state("domcontentloaded")
+            human_delay(1, 2)
+            handle_cookie_popup(page)
+            human_delay(0.5, 1)
+            submit_container_search(page, container_no)
 
             time.sleep(5)
 
