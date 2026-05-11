@@ -190,6 +190,7 @@ def _build_driver(proxy: Optional[str] = None) -> uc.Chrome:
         options=options,
         headless=True,
         use_subprocess=False,
+        version_main=146,
     )
 
     # ─────────────────────────────────────────────────────────────
