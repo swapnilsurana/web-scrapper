@@ -130,7 +130,7 @@ def _parse_movements_table(soup: BeautifulSoup) -> list[dict[str, str]]:
         return rows_out
     for tr in table.select("tbody tr"):
         tds = tr.find_all("td")
-        if len(tds) < 4:
+        if len(tds) < 5:
             continue
         cells = [td.get_text(" ", strip=True) for td in tds[1:5]]
         if len(cells) < 4:
@@ -139,12 +139,17 @@ def _parse_movements_table(soup: BeautifulSoup) -> list[dict[str, str]]:
         if date_s.lower() == "date" and "location" in loc_s.lower():
             continue
         if any([date_s, loc_s, event_s, mode_s]):
-            rows_out.append({
+            row: dict[str, str] = {
                 "date": date_s,
                 "location": loc_s,
                 "event": event_s,
                 "transport_mode": mode_s,
-            })
+            }
+            if len(tds) > 5:
+                extra = tds[5].get_text(" ", strip=True)
+                if extra:
+                    row["equipment"] = extra
+            rows_out.append(row)
     return rows_out
 
 
@@ -211,6 +216,28 @@ _CONTAINER_TYPE_REGEXES: tuple[re.Pattern[str], ...] = (
     re.compile(r"Equipment\s+type\s*[:\u2013\-|]?\s*(.+)", re.I),
     re.compile(r"EQ\s*\.?\s*type\s*[:\u2013\-|]?\s*(.+)", re.I),
     re.compile(r"Type\s*/\s*size\s*[:\u2013\-|]?\s*(.+)", re.I),
+    re.compile(r"Size\s*/\s*type\s*[:\u2013\-|]?\s*(.+)", re.I),
+)
+# Standalone equipment lines (no "Container type:" prefix on Visiwise).
+_EQUIPMENT_TOKEN_LINE = re.compile(
+    r"^(?:(?:20|40|45)\s*(?:ft|'|\u2032)?\s*(?:HC|DV|GP|HQ|RF|RH|TK|OT|FR)"
+    r"|(?:40|20|45)\s+HIGH\s+CUBE"
+    r"|(?:20|40)\s+DRY\s+VAN)\s*$",
+    re.I,
+)
+_EMBEDDED_EQUIPMENT = re.compile(
+    r"\b((?:20|40|45)\s*(?:ft|'|\u2032)?\s*(?:HC|DV|GP|HQ|RF|RH|TK|OT|FR))\b",
+    re.I,
+)
+_LAST_STATUS_ETA_HINT = re.compile(
+    r"\b(?:vessel\s+)?(?:arrival|arrived)\b",
+    re.I,
+)
+_MONTH_DAY_YEAR_TAIL = re.compile(
+    r"((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},\s*\d{4}"
+    r"(?:\s+(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)day)?"
+    r"(?:,\s*[\d:]+\s*(?:LT\b)?|\s+LT\b)?)",
+    re.I,
 )
 _POD_LINE_REGEX = re.compile(r"^POD\s*[:\u2013\-|]\s*(.+)$", re.I)
 _POL_LINE_REGEX = re.compile(r"^POL\s*[:\u2013\-|]\s*(.+)$", re.I)
@@ -275,6 +302,73 @@ def _infer_eta_from_movements(rows: list[dict[str, str]]) -> Optional[str]:
             merged = " ".join(x for x in (dt, ev, loc) if x).strip()
             if merged:
                 return merged[:500]
+    return None
+
+
+def _pod_location_token(pod: Optional[str]) -> Optional[str]:
+    if not pod:
+        return None
+    first = pod.split(",")[0].strip()
+    if not first:
+        return None
+    return first.split()[0].lower()
+
+
+def _infer_eta_from_pod_vessel_arrival(
+    rows: list[dict[str, str]], pod: Optional[str]
+) -> Optional[str]:
+    """
+    When POD does not expose a separate ETA field, Visiwise often only shows actual
+    vessel arrival at discharge — match the latest arrival at the POD location.
+    """
+    token = _pod_location_token(pod)
+    if not token or not rows:
+        return None
+    for row in reversed(rows):
+        ev = (row.get("event") or "").strip().lower()
+        loc = (row.get("location") or "").strip().lower()
+        dt = (row.get("date") or "").strip()
+        if not dt or "arrival" not in ev:
+            continue
+        if token not in loc:
+            continue
+        return dt[:500]
+    return None
+
+
+def _infer_eta_from_last_status(last_status: Optional[str]) -> Optional[str]:
+    """
+    LAST STATUS often reads like ``Vessel Arrival Dakar May 11, 2026 … LT`` with no ETA column.
+    """
+    if not last_status:
+        return None
+    text = last_status.strip()
+    if not _LAST_STATUS_ETA_HINT.search(text):
+        return None
+    m = _MONTH_DAY_YEAR_TAIL.search(text)
+    if m:
+        return m.group(1).strip()[:500]
+    return None
+
+
+def _infer_container_type_from_lines(lines: Iterable[str]) -> Optional[str]:
+    for raw in lines:
+        line = raw.strip()
+        if not line or len(line) > 72:
+            continue
+        if _EQUIPMENT_TOKEN_LINE.match(line):
+            return line[:500]
+        em = _EMBEDDED_EQUIPMENT.search(line)
+        if em and len(line) <= 96:
+            return em.group(1).strip()[:500]
+    return None
+
+
+def _infer_container_type_from_movements(rows: list[dict[str, str]]) -> Optional[str]:
+    for row in rows:
+        eq = (row.get("equipment") or "").strip()
+        if eq:
+            return eq[:500]
     return None
 
 
@@ -371,6 +465,16 @@ def _parse_tracking_overview(soup: BeautifulSoup) -> dict[str, Any]:
         ct_deep = _overview_container_type_deep_scan(soup)
         if ct_deep:
             overview["container_type"] = ct_deep
+
+    if "eta_pod" not in overview:
+        ls_eta = _infer_eta_from_last_status(overview.get("last_status"))
+        if ls_eta:
+            overview["eta_pod"] = ls_eta
+
+    if "container_type" not in overview:
+        ct_line = _infer_container_type_from_lines((*lines, *body_lines))
+        if ct_line:
+            overview["container_type"] = ct_line
 
     return overview
 
@@ -701,6 +805,15 @@ def track_visiwise_dashboard(
         inferred_eta = _infer_eta_from_movements(movements)
         if inferred_eta:
             overview["eta_pod"] = inferred_eta
+    if not overview.get("eta_pod"):
+        eta_arr = _infer_eta_from_pod_vessel_arrival(movements, overview.get("pod"))
+        if eta_arr:
+            overview["eta_pod"] = eta_arr
+
+    if not overview.get("container_type"):
+        ct_mv = _infer_container_type_from_movements(movements)
+        if ct_mv:
+            overview["container_type"] = ct_mv
 
     out["status"] = "success"
     out["overview"] = overview
