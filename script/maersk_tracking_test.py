@@ -15,7 +15,7 @@ import os
 import random
 import re
 import time
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
@@ -157,10 +157,11 @@ def _soup_label_value(soup: BeautifulSoup, label: str) -> Optional[str]:
         chunk = parent.find_parent()
         if chunk:
             text = chunk.get_text(" ", strip=True)
-            if text.startswith(label):
-                rest = text[len(label) :].strip()
+            m_pref = re.match(re.escape(label) + r"\s*(.*)", text, flags=re.I | re.DOTALL)
+            if m_pref:
+                rest = m_pref.group(1).strip()
                 if rest:
-                    one_line = rest.split("  ")[0].split("ETA")[0].strip()
+                    one_line = rest.split("  ")[0].strip()
                     return (one_line or rest)[:500]
         nxt = parent.find_next_sibling()
         if nxt:
@@ -170,18 +171,207 @@ def _soup_label_value(soup: BeautifulSoup, label: str) -> Optional[str]:
     return None
 
 
+def _collect_short_text_lines(soup: BeautifulSoup, max_len: int = 320) -> list[str]:
+    """Distinct short lines from likely overview widgets (Semantic UI–style pages)."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for el in soup.find_all(("div", "span", "td", "th", "label", "p", "li", "strong")):
+        line = el.get_text(" ", strip=True)
+        if not line or len(line) > max_len:
+            continue
+        if line in seen:
+            continue
+        seen.add(line)
+        out.append(line)
+    return out
+
+
+def _first_regex_capture(lines: Iterable[str], patterns: tuple[re.Pattern[str], ...]) -> Optional[str]:
+    for line in lines:
+        for rx in patterns:
+            m = rx.search(line.strip())
+            if not m:
+                continue
+            cap = m.group(1).strip() if m.lastindex else m.group(0).strip()
+            if cap:
+                return cap[:500]
+    return None
+
+
+# Inline labels common on Visiwise dashboard tracking HTML (wording varies).
+_ETA_LINE_REGEXES: tuple[re.Pattern[str], ...] = (
+    re.compile(r"ETA\s*\(\s*at\s*POD\s*\)\s*[:\u2013\-|]?\s*(.+)", re.I),
+    re.compile(r"ETA\s+at\s+POD\s*[:\u2013\-|]?\s*(.+)", re.I),
+    re.compile(r"POD\s+ETA\s*[:\u2013\-|]?\s*(.+)", re.I),
+    re.compile(r"Estimated\s+(?:time\s+of\s+)?arrival(?:\s+at\s+POD)?\s*[:\u2013\-|]?\s*(.+)", re.I),
+    re.compile(r"\bETA\s*[:\u2013\-|]\s*(.+)", re.I),
+)
+_CONTAINER_TYPE_REGEXES: tuple[re.Pattern[str], ...] = (
+    re.compile(r"Container\s+type\s*[:\u2013\-|]?\s*(.+)", re.I),
+    re.compile(r"Equipment\s+type\s*[:\u2013\-|]?\s*(.+)", re.I),
+    re.compile(r"EQ\s*\.?\s*type\s*[:\u2013\-|]?\s*(.+)", re.I),
+    re.compile(r"Type\s*/\s*size\s*[:\u2013\-|]?\s*(.+)", re.I),
+)
+_POD_LINE_REGEX = re.compile(r"^POD\s*[:\u2013\-|]\s*(.+)$", re.I)
+_POL_LINE_REGEX = re.compile(r"^POL\s*[:\u2013\-|]\s*(.+)$", re.I)
+
+
+def _body_plain_lines(soup: BeautifulSoup, max_line: int = 400) -> list[str]:
+    if not soup.body:
+        return []
+    out: list[str] = []
+    for ln in soup.body.get_text("\n", strip=True).split("\n"):
+        s = ln.strip()
+        if s and len(s) <= max_line:
+            out.append(s)
+    return out
+
+
+def _overview_eta_deep_scan(soup: BeautifulSoup) -> Optional[str]:
+    """Some layouts split label/value across nested nodes — scan ancestors of ETA text."""
+    for node in soup.find_all(string=re.compile(r"\bETA\b", re.I)):
+        el = getattr(node, "parent", None)
+        anc = el
+        for _ in range(5):
+            if anc is None:
+                break
+            blob = anc.get_text(" ", strip=True)
+            if blob and len(blob) <= 700:
+                got = _first_regex_capture([blob], _ETA_LINE_REGEXES)
+                if got:
+                    return got
+            anc = anc.parent
+    return None
+
+
+def _overview_container_type_deep_scan(soup: BeautifulSoup) -> Optional[str]:
+    for node in soup.find_all(string=re.compile(r"container\s+type|equipment\s+type|type\s*/\s*size", re.I)):
+        el = getattr(node, "parent", None)
+        anc = el
+        for _ in range(5):
+            if anc is None:
+                break
+            blob = anc.get_text(" ", strip=True)
+            if blob and len(blob) <= 400:
+                got = _first_regex_capture([blob], _CONTAINER_TYPE_REGEXES)
+                if got:
+                    return got
+            anc = anc.parent
+    return None
+
+
+def _infer_eta_from_movements(rows: list[dict[str, str]]) -> Optional[str]:
+    """Use timeline rows whose description mentions ETA / arrival when overview lacks a date."""
+    for row in reversed(rows):
+        ev = (row.get("event") or "").strip()
+        loc = (row.get("location") or "").strip()
+        dt = (row.get("date") or "").strip()
+        blob = f"{ev} {loc}".lower()
+        if not blob.strip():
+            continue
+        if "pod eta" in blob or "eta" in blob or (
+            "estimated" in blob and "arrival" in blob
+        ) or ("expected" in blob and "arrival" in blob):
+            merged = " ".join(x for x in (dt, ev, loc) if x).strip()
+            if merged:
+                return merged[:500]
+    return None
+
+
+def _overview_first_alias(soup: BeautifulSoup, aliases: tuple[str, ...]) -> Optional[str]:
+    for alias in sorted(aliases, key=len, reverse=True):
+        v = _soup_label_value(soup, alias)
+        if v:
+            return v
+    return None
+
+
 def _parse_tracking_overview(soup: BeautifulSoup) -> dict[str, Any]:
     overview: dict[str, Any] = {}
-    for key, label in (
-        ("last_status", "LAST STATUS"),
-        ("eta_pod", "ETA (at POD)"),
-        ("pol", "POL"),
-        ("pod", "POD"),
-        ("atd", "ATD"),
-    ):
-        v = _soup_label_value(soup, label)
+
+    field_aliases: tuple[tuple[str, tuple[str, ...]], ...] = (
+        ("last_status", ("LAST STATUS",)),
+        (
+            "eta_pod",
+            (
+                "ETA (at POD)",
+                "ETA at POD",
+                "ETA(AT POD)",
+                "ETA AT POD",
+                "POD ETA",
+                "Estimated arrival",
+                "Estimated Time of Arrival",
+            ),
+        ),
+        ("pol", ("POL", "PORT OF LOADING")),
+        ("pod", ("POD", "PORT OF DISCHARGE")),
+        ("atd", ("ATD",)),
+        (
+            "container_type",
+            (
+                "CONTAINER TYPE",
+                "CONTAINER TYPE / SIZE",
+                "CONTAINER TYPE/SIZE",
+                "EQ TYPE",
+                "EQUIPMENT TYPE",
+            ),
+        ),
+    )
+
+    for key, aliases in field_aliases:
+        v = _overview_first_alias(soup, aliases)
         if v:
             overview[key] = v
+
+    lines = _collect_short_text_lines(soup)
+
+    if "eta_pod" not in overview:
+        eta_guess = _first_regex_capture(lines, _ETA_LINE_REGEXES)
+        if eta_guess:
+            overview["eta_pod"] = eta_guess
+
+    if "container_type" not in overview:
+        ct_guess = _first_regex_capture(lines, _CONTAINER_TYPE_REGEXES)
+        if ct_guess:
+            overview["container_type"] = ct_guess
+
+    # POL/POD sometimes appear only as "POD: Shanghai …" inline without isolate label nodes.
+    if "pod" not in overview:
+        for line in lines:
+            if re.match(r"^POD\s+ETA\b", line, re.I):
+                continue
+            m = _POD_LINE_REGEX.match(line.strip())
+            if m:
+                overview["pod"] = m.group(1).strip()[:500]
+                break
+
+    if "pol" not in overview:
+        pol_guess = _first_regex_capture(lines, (_POL_LINE_REGEX,))
+        if pol_guess:
+            overview["pol"] = pol_guess
+
+    # Full body lines (ETA/value pairs sometimes sit in blocks larger than short widgets).
+    body_lines = _body_plain_lines(soup)
+    if "eta_pod" not in overview:
+        eta_body = _first_regex_capture(body_lines, _ETA_LINE_REGEXES)
+        if eta_body:
+            overview["eta_pod"] = eta_body
+
+    if "container_type" not in overview:
+        ct_body = _first_regex_capture(body_lines, _CONTAINER_TYPE_REGEXES)
+        if ct_body:
+            overview["container_type"] = ct_body
+
+    if "eta_pod" not in overview:
+        eta_deep = _overview_eta_deep_scan(soup)
+        if eta_deep:
+            overview["eta_pod"] = eta_deep
+
+    if "container_type" not in overview:
+        ct_deep = _overview_container_type_deep_scan(soup)
+        if ct_deep:
+            overview["container_type"] = ct_deep
+
     return overview
 
 
@@ -507,6 +697,10 @@ def track_visiwise_dashboard(
     soup = BeautifulSoup(html, "html.parser")
     movements = _parse_movements_table(soup)
     overview = _parse_tracking_overview(soup)
+    if not overview.get("eta_pod"):
+        inferred_eta = _infer_eta_from_movements(movements)
+        if inferred_eta:
+            overview["eta_pod"] = inferred_eta
 
     out["status"] = "success"
     out["overview"] = overview
@@ -571,14 +765,15 @@ def track_maersk_visiwise(container_no: str, headless: bool = True) -> dict[str,
         last_evt = movements[-1].get("event")
 
     logger.info(
-        "track_maersk_visiwise: success events=%d eta=%r",
+        "track_maersk_visiwise: success events=%d eta=%r container_type=%r",
         len(events),
         overview.get("eta_pod"),
+        overview.get("container_type"),
     )
     return {
         "status": "success",
         "container_number": raw.get("container_number"),
-        "container_type": None,
+        "container_type": overview.get("container_type"),
         "last_updated": None,
         "eta": overview.get("eta_pod"),
         "latest_event": overview.get("last_status") or last_evt,
