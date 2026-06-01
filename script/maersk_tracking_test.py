@@ -123,6 +123,40 @@ def _dismiss_tracking_tips(page) -> None:
         pass
 
 
+def _wait_for_dashboard_tracking_ready(page, timeout_ms: int = 120_000) -> Optional[str]:
+    """
+    Wait until the React tracking view has rendered (not just the URL).
+
+    Returns an error message if loading fails; otherwise None.
+    """
+    try:
+        page.wait_for_function(
+            """
+            () => {
+              if (document.querySelector('table.movements-new-table tbody tr')) {
+                return true;
+              }
+              const loader = document.querySelector('.shipup-loading.fullscreen');
+              if (loader && loader.offsetParent !== null) {
+                return false;
+              }
+              const text = document.body?.innerText || '';
+              return /LAST STATUS/i.test(text) && /\\bPOL\\b/.test(text);
+            }
+            """,
+            timeout=timeout_ms,
+        )
+    except Exception as e:
+        soup = BeautifulSoup(page.content(), "html.parser")
+        errs = _collect_error_messages(soup)
+        if errs:
+            return " | ".join(errs[:3])
+        if soup.select_one(".shipup-loading.fullscreen"):
+            return "Tracking page did not finish loading (spinner still visible)."
+        return f"Tracking page did not finish loading: {e}"
+    return None
+
+
 def _parse_movements_table(soup: BeautifulSoup) -> list[dict[str, str]]:
     rows_out: list[dict[str, str]] = []
     table = soup.select_one("table.movements-new-table")
@@ -790,9 +824,21 @@ def track_visiwise_dashboard(
             browser.close()
             return out
 
-        human_delay(2, 3.5)
         _dismiss_tracking_tips(page)
 
+        load_err = _wait_for_dashboard_tracking_ready(page)
+        if load_err:
+            out["status"] = "error"
+            out["message"] = load_err
+            out["final_url"] = page.url
+            logger.warning("Dashboard: tracking content not ready: %s", load_err)
+            if debug_html_path:
+                _save_debug(page, debug_html_path)
+                logger.debug("Saved debug HTML to %s", debug_html_path)
+            browser.close()
+            return out
+
+        human_delay(0.3, 0.8)
         final_url = page.url
         html = page.content()
         browser.close()
@@ -814,6 +860,14 @@ def track_visiwise_dashboard(
         ct_mv = _infer_container_type_from_movements(movements)
         if ct_mv:
             overview["container_type"] = ct_mv
+
+    if not movements and not overview:
+        out["status"] = "unknown"
+        out["message"] = (
+            "Tracking page loaded but no movements or overview could be parsed."
+        )
+        logger.warning("Dashboard track result: unknown (empty parse)")
+        return out
 
     out["status"] = "success"
     out["overview"] = overview
