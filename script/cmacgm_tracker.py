@@ -441,5 +441,5 @@ def get_cmacgm_tracking(container_no: str, headless: bool = False) -> dict:
 
 if __name__ == "__main__":
     from pprint import pprint
-    result = get_cmacgm_tracking("GESU1396924")
+    result = get_cmacgm_tracking("APZU3737048")
     pprint(result)

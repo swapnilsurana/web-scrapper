@@ -300,6 +300,7 @@ def normalize_one(raw: dict) -> dict:
 NORMALIZERS = {
     "maersk": normalize_maersk,
     "maersk_visiwise": normalize_maersk,
+    "visiwise": normalize_maersk,
     "msc": normalize_msc,
     "cmacgm": normalize_cmacgm,
     "cosco": normalize_cosco,

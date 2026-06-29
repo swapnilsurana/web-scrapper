@@ -1,0 +1,1269 @@
+"""
+Visiwise container tracking:
+- Public page: https://www.visiwise.co/tracking/container/maersk/ (weekly free limit).
+- Dashboard (authenticated): https://app.visiwise.co — login, Track Shipment, carrier dropdown, parse tracking page.
+
+The dashboard supports many shipping lines (Maersk, MSC, CMA CGM, COSCO, PIL, ONE, …).
+Use ``track_visiwise(container, carrier)`` or the API with ``source: "visiwise"``.
+
+Set credentials in environment (recommended: add to your local .env, never commit):
+  VISIWISE_EMAIL=...
+  VISIWISE_PASSWORD=...
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import random
+import re
+import time
+from typing import Any, Iterable, Optional
+
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+from playwright.sync_api import sync_playwright
+
+VISIWISE_MAERSK_URL = "https://www.visiwise.co/tracking/container/maersk/"
+VISIWISE_APP_ROOT = "https://app.visiwise.co"
+VISIWISE_LOGIN_NEXT_SHIPMENT = f"{VISIWISE_APP_ROOT}/login/?next=/shipment/new/"
+
+# API carrier keys -> exact labels in the Visiwise dashboard #line dropdown.
+VISIWISE_CARRIER_LABELS: dict[str, str] = {
+    "maersk": "Maersk",
+    "msc": "MSC",
+    "cmacgm": "CMA CGM",
+    "cnc": "CNC",
+    "cosco": "COSCO",
+    "goldstarline": "Gold Star",
+    "goldstar": "Gold Star",
+    "pil": "PIL",
+    "one": "One",
+    "oocl": "OOCL",
+    "evergreen": "Evergreen",
+    "hapaglloyd": "Hapag-Lloyd",
+    "hamburgsud": "Hamburg Sud",
+    "yangming": "Yang Ming",
+    "zim": "ZIM",
+    "hmm": "HMM",
+    "hyundai": "HMM",
+    "wanhai": "Wan Hai",
+    "sealand": "Sealand",
+    "safmarine": "Safmarine",
+    "apl": "APL",
+    "anl": "ANL",
+    "smline": "SM Line",
+    "acl": "ACL",
+    "arkas": "Arkas",
+    "crowley": "Crowley",
+    "culines": "CULines",
+    "emirates": "Emirates Shipping Line",
+    "grimaldi": "Grimaldi",
+    "kmtc": "KMTC",
+    "matson": "Matson",
+    "messina": "Messina",
+    "namsung": "Namsung",
+    "rcl": "RCL",
+    "samskip": "Samskip",
+    "sci": "SCI",
+    "seaboardmarine": "Seaboard Marine",
+    "sealead": "SeaLead",
+    "sethshipping": "Seth Shipping",
+    "swire": "Swire Shipping",
+    "totemaritime": "TOTE Maritime",
+    "tslines": "T.S. Lines",
+    "turkon": "Turkon",
+    "unifeeder": "Unifeeder",
+    "weclines": "WEC Lines",
+    "westwood": "Westwood Shipping Lines",
+    "autodetect": "✨ Auto Detect",
+}
+
+logger = logging.getLogger(__name__)
+
+
+def _normalize_carrier_key(carrier: str) -> str:
+    return (carrier or "").lower().replace(" ", "").replace("-", "").replace("_", "")
+
+
+def resolve_visiwise_carrier(carrier: str) -> str:
+    """
+    Map an API carrier key to the Visiwise dashboard dropdown label.
+
+    If the key is unknown, ``carrier`` is returned as-is so callers can pass
+    the exact Visiwise label (e.g. ``"CMA CGM"``).
+    """
+    key = _normalize_carrier_key(carrier)
+    return VISIWISE_CARRIER_LABELS.get(key, (carrier or "").strip())
+
+
+def list_visiwise_carrier_keys() -> list[str]:
+    return sorted(VISIWISE_CARRIER_LABELS.keys())
+
+
+def human_delay(a: float = 1.5, b: float = 3.5) -> None:
+    time.sleep(random.uniform(a, b))
+
+
+def handle_cookie_popup(page) -> None:
+    for text in ("Got it", "Allow all", "Allow All", "Accept All", "Accept"):
+        try:
+            btn = page.get_by_role("button", name=text).first
+            if btn.is_visible(timeout=2500):
+                btn.click()
+                logger.debug("Cookie/consent dismissed via button %r", text)
+                return
+        except Exception:
+            pass
+
+
+def _save_debug(page, path: str) -> None:
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(page.content())
+    except OSError:
+        pass
+
+
+def _visible_usage_limit_message(soup: BeautifulSoup) -> Optional[str]:
+    el = soup.select_one("#tracking-usage-limitation-message")
+    if not el:
+        return None
+    styles = el.get("style") or ""
+    if "display:none" in styles.replace(" ", "") or "display: none" in styles:
+        return None
+    text = re.sub(r"\s+", " ", el.get_text(" ", strip=True))
+    if not text:
+        return None
+    if "reached the limitation" in text.lower():
+        return text
+    return text
+
+
+def _collect_error_messages(soup: BeautifulSoup) -> list[str]:
+    out: list[str] = []
+    for sel in (".ui.message.negative", ".ui.error.message", ".field.error"):
+        for el in soup.select(sel):
+            t = el.get_text(" ", strip=True)
+            if t and t not in out:
+                out.append(t)
+    return out
+
+
+def _parse_tracking_blocks(soup: BeautifulSoup) -> dict[str, Any]:
+    data: dict[str, Any] = {"tables": [], "sections": []}
+
+    for table in soup.select("table"):
+        rows = []
+        for tr in table.select("tr"):
+            cells = [c.get_text(" ", strip=True) for c in tr.select("th, td")]
+            if any(cells):
+                rows.append(cells)
+        if rows:
+            data["tables"].append(rows)
+
+    for header in soup.select("h2, h3, .ui.header"):
+        title = header.get_text(" ", strip=True)
+        if not title or len(title) > 120:
+            continue
+        parent = header.find_parent("div")
+        if not parent:
+            continue
+        chunk = parent.get_text(" ", strip=True)
+        if chunk and title.lower() not in ("maersk container tracking", "container tracking"):
+            if len(chunk) > len(title) + 20:
+                data["sections"].append({"title": title, "text": chunk[:2000]})
+
+    return data
+
+
+def _wait_post_login(page, timeout_ms: int = 120_000) -> bool:
+    deadline = time.time() + timeout_ms / 1000.0
+    while time.time() < deadline:
+        if "/login" not in page.url:
+            return True
+        page.wait_for_timeout(500)
+    return "/login" not in page.url
+
+
+def _visiwise_trial_blocked_message(page) -> Optional[str]:
+    try:
+        modal = page.locator(".ui.page.modals.dimmer.visible.active")
+        if modal.count() == 0:
+            return None
+        text = modal.inner_text(timeout=2000)
+        lowered = text.lower()
+        if "trial has ended" in lowered or "upgrade now" in lowered:
+            return (
+                "Visiwise trial has ended; upgrade is required to track shipments on the dashboard."
+            )
+    except Exception:
+        pass
+    return None
+
+
+def _select_visiwise_line(page, line_label: str) -> None:
+    """Pick a shipping line in the dashboard #line Semantic UI search dropdown."""
+    page.locator("#line").click(timeout=10_000, force=True)
+    search = page.locator("#line input.search")
+    search.fill("", force=True)
+    search.fill(line_label, force=True)
+    page.wait_for_timeout(400)
+    item = page.locator("#line .menu .item").filter(
+        has=page.locator("span.text", has_text=line_label)
+    )
+    item.first.click(force=True, timeout=10_000)
+
+
+def _dismiss_blocking_modals(page) -> None:
+    for text in ("Got it", "Skip", "Close", "Not now", "Maybe later"):
+        try:
+            btn = page.get_by_role("button", name=text).first
+            if btn.is_visible(timeout=1500):
+                btn.click()
+                page.wait_for_timeout(400)
+                return
+        except Exception:
+            pass
+
+
+def _dismiss_tracking_tips(page) -> None:
+    try:
+        btn = page.get_by_role("button", name="Got it")
+        if btn.is_visible(timeout=2000):
+            btn.click()
+            page.wait_for_timeout(400)
+    except Exception:
+        pass
+
+
+def _wait_for_dashboard_tracking_ready(page, timeout_ms: int = 120_000) -> Optional[str]:
+    """
+    Wait until the React tracking view has rendered (not just the URL).
+
+    Returns an error message if loading fails; otherwise None.
+    """
+    try:
+        page.wait_for_function(
+            """
+            () => {
+              if (document.querySelector('table.movements-new-table tbody tr')) {
+                return true;
+              }
+              const loader = document.querySelector('.shipup-loading.fullscreen');
+              if (loader && loader.offsetParent !== null) {
+                return false;
+              }
+              const text = document.body?.innerText || '';
+              const hasRoute = /POL\\s+\\S+/i.test(text) && /POD\\s+\\S+/i.test(text);
+              return hasRoute || (/LAST STATUS/i.test(text) && /\\bPOL\\b/.test(text));
+            }
+            """,
+            timeout=timeout_ms,
+        )
+    except Exception as e:
+        soup = BeautifulSoup(page.content(), "html.parser")
+        errs = _collect_error_messages(soup)
+        if errs:
+            return " | ".join(errs[:3])
+        if soup.select_one(".shipup-loading.fullscreen"):
+            return "Tracking page did not finish loading (spinner still visible)."
+        return f"Tracking page did not finish loading: {e}"
+    return None
+
+
+def _parse_movements_table(soup: BeautifulSoup) -> list[dict[str, str]]:
+    rows_out: list[dict[str, str]] = []
+    table = soup.select_one("table.movements-new-table")
+    if not table:
+        return rows_out
+    for tr in table.select("tbody tr"):
+        tds = tr.find_all("td")
+        if len(tds) < 5:
+            continue
+        cells = [td.get_text(" ", strip=True) for td in tds[1:5]]
+        if len(cells) < 4:
+            continue
+        date_s, loc_s, event_s, mode_s = cells[0], cells[1], cells[2], cells[3]
+        if date_s.lower() == "date" and "location" in loc_s.lower():
+            continue
+        if any([date_s, loc_s, event_s, mode_s]):
+            row: dict[str, str] = {
+                "date": date_s,
+                "location": loc_s,
+                "event": event_s,
+                "transport_mode": mode_s,
+            }
+            if len(tds) > 5:
+                extra = tds[5].get_text(" ", strip=True)
+                if extra:
+                    row["equipment"] = extra
+            rows_out.append(row)
+    return rows_out
+
+
+def _soup_label_value(soup: BeautifulSoup, label: str) -> Optional[str]:
+    pat = re.compile(r"^\s*" + re.escape(label) + r"\s*$", re.I)
+    for el in soup.find_all(string=pat):
+        parent = el.parent
+        if not parent:
+            continue
+        chunk = parent.find_parent()
+        if chunk:
+            text = chunk.get_text(" ", strip=True)
+            m_pref = re.match(re.escape(label) + r"\s*(.*)", text, flags=re.I | re.DOTALL)
+            if m_pref:
+                rest = m_pref.group(1).strip()
+                if rest:
+                    one_line = rest.split("  ")[0].strip()
+                    return (one_line or rest)[:500]
+        nxt = parent.find_next_sibling()
+        if nxt:
+            v = nxt.get_text(" ", strip=True)
+            if v:
+                return v[:500]
+    return None
+
+
+def _collect_short_text_lines(soup: BeautifulSoup, max_len: int = 320) -> list[str]:
+    """Distinct short lines from likely overview widgets (Semantic UI–style pages)."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for el in soup.find_all(("div", "span", "td", "th", "label", "p", "li", "strong")):
+        line = el.get_text(" ", strip=True)
+        if not line or len(line) > max_len:
+            continue
+        if line in seen:
+            continue
+        seen.add(line)
+        out.append(line)
+    return out
+
+
+def _first_regex_capture(lines: Iterable[str], patterns: tuple[re.Pattern[str], ...]) -> Optional[str]:
+    for line in lines:
+        for rx in patterns:
+            m = rx.search(line.strip())
+            if not m:
+                continue
+            cap = m.group(1).strip() if m.lastindex else m.group(0).strip()
+            if cap:
+                return cap[:500]
+    return None
+
+
+# Inline labels common on Visiwise dashboard tracking HTML (wording varies).
+_ETA_LINE_REGEXES: tuple[re.Pattern[str], ...] = (
+    re.compile(r"ETA\s*\(\s*at\s*POD\s*\)\s*[:\u2013\-|]?\s*(.+)", re.I),
+    re.compile(r"ETA\s+at\s+POD\s*[:\u2013\-|]?\s*(.+)", re.I),
+    re.compile(r"POD\s+ETA\s*[:\u2013\-|]?\s*(.+)", re.I),
+    re.compile(r"Estimated\s+(?:time\s+of\s+)?arrival(?:\s+at\s+POD)?\s*[:\u2013\-|]?\s*(.+)", re.I),
+    re.compile(r"\bETA\s*[:\u2013\-|]\s*(.+)", re.I),
+)
+_CONTAINER_TYPE_REGEXES: tuple[re.Pattern[str], ...] = (
+    re.compile(r"Container\s+type\s*[:\u2013\-|]?\s*(.+)", re.I),
+    re.compile(r"Equipment\s+type\s*[:\u2013\-|]?\s*(.+)", re.I),
+    re.compile(r"EQ\s*\.?\s*type\s*[:\u2013\-|]?\s*(.+)", re.I),
+    re.compile(r"Type\s*/\s*size\s*[:\u2013\-|]?\s*(.+)", re.I),
+    re.compile(r"Size\s*/\s*type\s*[:\u2013\-|]?\s*(.+)", re.I),
+)
+# Standalone equipment lines (no "Container type:" prefix on Visiwise).
+_EQUIPMENT_TOKEN_LINE = re.compile(
+    r"^(?:(?:20|40|45)\s*(?:ft|'|\u2032|\u2019)?\s*(?:HC|DV|GP|HQ|RF|RH|TK|OT|FR|General Purpose|High Cube|Dry Van|Reefer)"
+    r"|(?:40|20|45)\s+HIGH\s+CUBE"
+    r"|(?:20|40)\s+DRY\s+VAN)\s*$",
+    re.I,
+)
+_EMBEDDED_EQUIPMENT = re.compile(
+    r"\b((?:20|40|45)\s*(?:ft|'|\u2032)?\s*(?:HC|DV|GP|HQ|RF|RH|TK|OT|FR))\b",
+    re.I,
+)
+_LAST_STATUS_ETA_HINT = re.compile(
+    r"\b(?:vessel\s+)?(?:arrival|arrived)\b",
+    re.I,
+)
+_MONTH_DAY_YEAR_TAIL = re.compile(
+    r"((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},\s*\d{4}"
+    r"(?:\s+(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)day)?"
+    r"(?:,\s*[\d:]+\s*(?:LT\b)?|\s+LT\b)?)",
+    re.I,
+)
+_POD_LINE_REGEX = re.compile(r"^POD\s*[:\u2013\-|]\s*(.+)$", re.I)
+_POL_LINE_REGEX = re.compile(r"^POL\s*[:\u2013\-|]\s*(.+)$", re.I)
+_ROUTE_POL = re.compile(r"^POL\s+(.+?)\s+ATD\s+(.+)$", re.I)
+_ROUTE_POD = re.compile(r"^POD\s+(.+?)\s+ATA\s+(.+)$", re.I)
+_PLACEHOLDER_VALUE = re.compile(
+    r"^[\s\-–—_./|]+$|^--.*---.*---.*--$|^n/a$|^tbd$|^unknown$",
+    re.I,
+)
+_CONTAINER_SIZE_TYPE = re.compile(
+    r"\b((?:20|40|45)\s*[\u2019'′]?\s*"
+    r"(?:General Purpose|High Cube|Dry Van|Reefer|Palletwide|Open Top|Flat Rack|Platform|Tank"
+    r"|HC|HQ|GP|DV|RF|RH|TK|OT|FR)(?:\s+\w+)*)",
+    re.I,
+)
+
+
+def _clean_overview_value(val: Optional[str]) -> Optional[str]:
+    if val is None:
+        return None
+    s = val.strip()
+    if not s or _PLACEHOLDER_VALUE.match(s):
+        return None
+    if re.search(r"---\s*ETA\s*---", s, re.I):
+        return None
+    if re.match(r"^--+\s*.*\s*--+$", s):
+        return None
+    return s[:500]
+
+
+def _location_city(location: Optional[str]) -> Optional[str]:
+    if not location:
+        return None
+    city = location.split(",")[0].strip()
+    return city or None
+
+
+def _parse_route_timeline(soup: BeautifulSoup) -> dict[str, str]:
+    """Route tab milestones: ``POL Shanghai ATD …``, ``POD Tema ATA …``."""
+    out: dict[str, str] = {}
+    for line in _body_plain_lines(soup):
+        stripped = line.strip()
+        m_pol = _ROUTE_POL.match(stripped)
+        if m_pol and "pol" not in out:
+            out["pol"] = m_pol.group(1).strip()
+            out["atd"] = m_pol.group(2).strip()
+        m_pod = _ROUTE_POD.match(stripped)
+        if m_pod and "pod" not in out:
+            out["pod"] = m_pod.group(1).strip()
+            out["eta_pod"] = m_pod.group(2).strip()
+    return out
+
+
+def _parse_container_type_from_page(soup: BeautifulSoup) -> Optional[str]:
+    for line in _body_plain_lines(soup):
+        m = _CONTAINER_SIZE_TYPE.search(line)
+        if m:
+            return m.group(1).strip()[:500]
+    return None
+
+
+def _infer_pol_from_movements(rows: list[dict[str, str]]) -> Optional[str]:
+    for row in rows:
+        ev = (row.get("event") or "").strip().lower()
+        if ev in ("load on vessel", "vessel departure", "export gate in"):
+            city = _location_city(row.get("location"))
+            if city:
+                return city
+    return None
+
+
+def _infer_pod_from_movements(rows: list[dict[str, str]]) -> Optional[str]:
+    for row in reversed(rows):
+        ev = (row.get("event") or "").strip().lower()
+        if "discharge" in ev and "vessel" in ev:
+            city = _location_city(row.get("location"))
+            if city:
+                return city
+    return None
+
+
+def _fill_overview_gaps(overview: dict[str, Any], movements: list[dict[str, str]]) -> dict[str, Any]:
+    """Sanitize values and back-fill POL/POD/ETA/container type from route + movements."""
+    cleaned: dict[str, Any] = {}
+    for key, val in overview.items():
+        if isinstance(val, str):
+            v = _clean_overview_value(val)
+            if v is not None:
+                cleaned[key] = v
+        elif val is not None:
+            cleaned[key] = val
+
+    if not cleaned.get("pol"):
+        pol = _infer_pol_from_movements(movements)
+        if pol:
+            cleaned["pol"] = pol
+
+    if not cleaned.get("pod"):
+        pod = _infer_pod_from_movements(movements)
+        if pod:
+            cleaned["pod"] = pod
+
+    if not cleaned.get("eta_pod"):
+        inferred_eta = _infer_eta_from_movements(movements)
+        if inferred_eta:
+            cleaned["eta_pod"] = _clean_overview_value(inferred_eta)
+
+    if not cleaned.get("eta_pod"):
+        eta_arr = _infer_eta_from_pod_vessel_arrival(movements, cleaned.get("pod"))
+        if eta_arr:
+            cleaned["eta_pod"] = _clean_overview_value(eta_arr)
+
+    if not cleaned.get("container_type"):
+        ct_mv = _infer_container_type_from_movements(movements)
+        if ct_mv:
+            cleaned["container_type"] = ct_mv
+
+    return cleaned
+
+
+def _body_plain_lines(soup: BeautifulSoup, max_line: int = 400) -> list[str]:
+    if not soup.body:
+        return []
+    out: list[str] = []
+    for ln in soup.body.get_text("\n", strip=True).split("\n"):
+        s = ln.strip()
+        if s and len(s) <= max_line:
+            out.append(s)
+    return out
+
+
+def _overview_eta_deep_scan(soup: BeautifulSoup) -> Optional[str]:
+    """Some layouts split label/value across nested nodes — scan ancestors of ETA text."""
+    for node in soup.find_all(string=re.compile(r"\bETA\b", re.I)):
+        el = getattr(node, "parent", None)
+        anc = el
+        for _ in range(5):
+            if anc is None:
+                break
+            blob = anc.get_text(" ", strip=True)
+            if blob and len(blob) <= 700:
+                got = _first_regex_capture([blob], _ETA_LINE_REGEXES)
+                if got:
+                    return got
+            anc = anc.parent
+    return None
+
+
+def _overview_container_type_deep_scan(soup: BeautifulSoup) -> Optional[str]:
+    for node in soup.find_all(string=re.compile(r"container\s+type|equipment\s+type|type\s*/\s*size", re.I)):
+        el = getattr(node, "parent", None)
+        anc = el
+        for _ in range(5):
+            if anc is None:
+                break
+            blob = anc.get_text(" ", strip=True)
+            if blob and len(blob) <= 400:
+                got = _first_regex_capture([blob], _CONTAINER_TYPE_REGEXES)
+                if got:
+                    return got
+            anc = anc.parent
+    return None
+
+
+def _infer_eta_from_movements(rows: list[dict[str, str]]) -> Optional[str]:
+    """Use timeline rows whose description mentions ETA / arrival when overview lacks a date."""
+    for row in reversed(rows):
+        ev = (row.get("event") or "").strip()
+        loc = (row.get("location") or "").strip()
+        dt = (row.get("date") or "").strip()
+        blob = f"{ev} {loc}".lower()
+        if not blob.strip():
+            continue
+        if "pod eta" in blob or "eta" in blob or (
+            "estimated" in blob and "arrival" in blob
+        ) or ("expected" in blob and "arrival" in blob):
+            merged = " ".join(x for x in (dt, ev, loc) if x).strip()
+            if merged:
+                return merged[:500]
+    return None
+
+
+def _pod_location_token(pod: Optional[str]) -> Optional[str]:
+    if not pod:
+        return None
+    first = pod.split(",")[0].strip()
+    if not first:
+        return None
+    return first.split()[0].lower()
+
+
+def _infer_eta_from_pod_vessel_arrival(
+    rows: list[dict[str, str]], pod: Optional[str]
+) -> Optional[str]:
+    """
+    When POD does not expose a separate ETA field, Visiwise often only shows actual
+    vessel arrival at discharge — match the latest arrival at the POD location.
+    """
+    token = _pod_location_token(pod)
+    if not token or not rows:
+        return None
+    for row in reversed(rows):
+        ev = (row.get("event") or "").strip().lower()
+        loc = (row.get("location") or "").strip().lower()
+        dt = (row.get("date") or "").strip()
+        if not dt:
+            continue
+        if "arrival" not in ev and not ("discharge" in ev and "vessel" in ev):
+            continue
+        if token not in loc:
+            continue
+        return dt[:500]
+    return None
+
+
+def _infer_eta_from_last_status(last_status: Optional[str]) -> Optional[str]:
+    """
+    LAST STATUS often reads like ``Vessel Arrival Dakar May 11, 2026 … LT`` with no ETA column.
+    """
+    if not last_status:
+        return None
+    text = last_status.strip()
+    if not _LAST_STATUS_ETA_HINT.search(text):
+        return None
+    m = _MONTH_DAY_YEAR_TAIL.search(text)
+    if m:
+        return m.group(1).strip()[:500]
+    return None
+
+
+def _infer_container_type_from_lines(lines: Iterable[str]) -> Optional[str]:
+    for raw in lines:
+        line = raw.strip()
+        if not line or len(line) > 72:
+            continue
+        if _EQUIPMENT_TOKEN_LINE.match(line):
+            return line[:500]
+        em = _EMBEDDED_EQUIPMENT.search(line)
+        if em and len(line) <= 96:
+            return em.group(1).strip()[:500]
+    return None
+
+
+def _infer_container_type_from_movements(rows: list[dict[str, str]]) -> Optional[str]:
+    for row in rows:
+        eq = (row.get("equipment") or "").strip()
+        if eq:
+            return eq[:500]
+    return None
+
+
+def _overview_first_alias(soup: BeautifulSoup, aliases: tuple[str, ...]) -> Optional[str]:
+    for alias in sorted(aliases, key=len, reverse=True):
+        v = _clean_overview_value(_soup_label_value(soup, alias))
+        if v:
+            return v
+    return None
+
+
+def _parse_tracking_overview(soup: BeautifulSoup) -> dict[str, Any]:
+    overview: dict[str, Any] = dict(_parse_route_timeline(soup))
+
+    field_aliases: tuple[tuple[str, tuple[str, ...]], ...] = (
+        ("last_status", ("LAST STATUS",)),
+        (
+            "eta_pod",
+            (
+                "ETA (at POD)",
+                "ETA at POD",
+                "ETA(AT POD)",
+                "ETA AT POD",
+                "POD ETA",
+                "Estimated arrival",
+                "Estimated Time of Arrival",
+            ),
+        ),
+        ("pol", ("POL", "PORT OF LOADING")),
+        ("pod", ("POD", "PORT OF DISCHARGE")),
+        ("atd", ("ATD",)),
+        (
+            "container_type",
+            (
+                "CONTAINER TYPE",
+                "CONTAINER TYPE / SIZE",
+                "CONTAINER TYPE/SIZE",
+                "EQ TYPE",
+                "EQUIPMENT TYPE",
+            ),
+        ),
+    )
+
+    for key, aliases in field_aliases:
+        v = _overview_first_alias(soup, aliases)
+        if v and not overview.get(key):
+            overview[key] = v
+
+    lines = _collect_short_text_lines(soup)
+
+    if not overview.get("eta_pod"):
+        eta_guess = _clean_overview_value(_first_regex_capture(lines, _ETA_LINE_REGEXES))
+        if eta_guess:
+            overview["eta_pod"] = eta_guess
+
+    if not overview.get("container_type"):
+        ct_guess = _clean_overview_value(_first_regex_capture(lines, _CONTAINER_TYPE_REGEXES))
+        if ct_guess:
+            overview["container_type"] = ct_guess
+
+    # POL/POD sometimes appear only as "POD: Shanghai …" inline without isolate label nodes.
+    if not overview.get("pod"):
+        for line in lines:
+            if re.match(r"^POD\s+ETA\b", line, re.I):
+                continue
+            m = _POD_LINE_REGEX.match(line.strip())
+            if m:
+                overview["pod"] = _clean_overview_value(m.group(1).strip())
+                if overview.get("pod"):
+                    break
+            m_route = _ROUTE_POD.match(line.strip())
+            if m_route:
+                overview["pod"] = _clean_overview_value(m_route.group(1).strip())
+                if not overview.get("eta_pod"):
+                    overview["eta_pod"] = _clean_overview_value(m_route.group(2).strip())
+                if overview.get("pod"):
+                    break
+
+    if not overview.get("pol"):
+        pol_guess = _clean_overview_value(_first_regex_capture(lines, (_POL_LINE_REGEX,)))
+        if pol_guess:
+            overview["pol"] = pol_guess
+        else:
+            for line in lines:
+                m_route = _ROUTE_POL.match(line.strip())
+                if m_route:
+                    overview["pol"] = _clean_overview_value(m_route.group(1).strip())
+                    if not overview.get("atd"):
+                        overview["atd"] = _clean_overview_value(m_route.group(2).strip())
+                    break
+
+    # Full body lines (ETA/value pairs sometimes sit in blocks larger than short widgets).
+    body_lines = _body_plain_lines(soup)
+    if not overview.get("eta_pod"):
+        eta_body = _clean_overview_value(_first_regex_capture(body_lines, _ETA_LINE_REGEXES))
+        if eta_body:
+            overview["eta_pod"] = eta_body
+
+    if not overview.get("container_type"):
+        ct_body = _clean_overview_value(_first_regex_capture(body_lines, _CONTAINER_TYPE_REGEXES))
+        if ct_body:
+            overview["container_type"] = ct_body
+
+    if not overview.get("eta_pod"):
+        eta_deep = _clean_overview_value(_overview_eta_deep_scan(soup))
+        if eta_deep:
+            overview["eta_pod"] = eta_deep
+
+    if not overview.get("container_type"):
+        ct_deep = _clean_overview_value(_overview_container_type_deep_scan(soup))
+        if ct_deep:
+            overview["container_type"] = ct_deep
+
+    if not overview.get("container_type"):
+        ct_page = _parse_container_type_from_page(soup)
+        if ct_page:
+            overview["container_type"] = ct_page
+
+    if not overview.get("eta_pod"):
+        ls_eta = _clean_overview_value(_infer_eta_from_last_status(overview.get("last_status")))
+        if ls_eta:
+            overview["eta_pod"] = ls_eta
+
+    if not overview.get("container_type"):
+        ct_line = _infer_container_type_from_lines((*lines, *body_lines))
+        if ct_line:
+            overview["container_type"] = ct_line
+
+    return {k: v for k, v in overview.items() if v is not None}
+
+
+def get_visiwise_maersk_tracking(
+    container_no: str,
+    *,
+    headless: bool = False,
+    carrier: str = "MAERSK",
+    debug_html_path: Optional[str] = None,
+) -> dict[str, Any]:
+    """
+    Submit container number on the public Visiwise Maersk page.
+
+    ``carrier`` is the internal option value for #id_carrier (e.g. MAERSK, MSC).
+    """
+    container_no = (container_no or "").strip().upper()
+    out: dict[str, Any] = {
+        "status": "error",
+        "source": "visiwise_public",
+        "url": VISIWISE_MAERSK_URL,
+        "container_number": container_no,
+    }
+
+    logger.info(
+        "Visiwise public track: container=%s carrier=%s headless=%s",
+        container_no or "(empty)",
+        carrier,
+        headless,
+    )
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=headless,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/123.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1366, "height": 768},
+            locale="en-US",
+            timezone_id="Asia/Kolkata",
+        )
+        page = context.new_page()
+        page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined
+            });
+        """)
+
+        logger.debug("Navigating to %s", VISIWISE_MAERSK_URL)
+        page.goto(VISIWISE_MAERSK_URL, timeout=90000, wait_until="domcontentloaded")
+        page.wait_for_load_state("domcontentloaded")
+        human_delay(2, 3)
+        handle_cookie_popup(page)
+        human_delay(0.5, 1.0)
+
+        try:
+            page.locator("#id_specifier").wait_for(state="visible", timeout=20000)
+        except Exception as e:
+            out["message"] = f"Tracking form not found: {e}"
+            logger.warning("Public page: tracking form not found: %s", e)
+            if debug_html_path:
+                _save_debug(page, debug_html_path)
+                logger.debug("Saved debug HTML to %s", debug_html_path)
+            browser.close()
+            return out
+
+        page.locator("#id_timezone").wait_for(state="attached", timeout=10000)
+        try:
+            page.wait_for_function(
+                "() => document.querySelector('#id_timezone')?.value?.length > 0",
+                timeout=15000,
+            )
+        except Exception:
+            page.evaluate(
+                """() => {
+                const el = document.querySelector('#id_timezone');
+                if (el && !el.value) {
+                  el.value = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+                }
+            }"""
+            )
+
+        page.locator("#id_specifier").click()
+        page.locator("#id_specifier").fill(container_no)
+        human_delay(0.3, 0.7)
+
+        try:
+            page.locator("#id_carrier").select_option(value=carrier)
+        except Exception:
+            logger.debug("Carrier select_option failed or skipped for %r", carrier)
+
+        human_delay(0.3, 0.6)
+
+        logger.debug("Submitting Track Container")
+        with page.expect_navigation(wait_until="domcontentloaded", timeout=90000):
+            page.locator("#containerTrackingForm").locator(
+                'input[type="submit"][value="Track Container"]'
+            ).click()
+
+        human_delay(2, 3)
+        final_url = page.url
+        out["final_url"] = final_url
+        logger.debug("Navigation complete final_url=%s", final_url)
+
+        html = page.content()
+        soup = BeautifulSoup(html, "html.parser")
+        browser.close()
+
+    if "app.visiwise.co" in final_url:
+        out["status"] = "redirect"
+        out["message"] = "Redirected to Visiwise app; login may be required to view results."
+        logger.info("Public track result: redirect to app (login may be required)")
+        return out
+
+    limit_msg = _visible_usage_limit_message(soup)
+    if limit_msg:
+        out["status"] = "rate_limited"
+        out["message"] = limit_msg
+        logger.warning("Public track result: rate_limited (%s)", limit_msg[:120])
+        return out
+
+    errors = _collect_error_messages(soup)
+    if errors:
+        joined = " | ".join(errors[:5])
+        if any("invalid" in e.lower() or "required" in e.lower() for e in errors):
+            out["status"] = "validation_error"
+            out["message"] = joined
+            logger.info("Public track result: validation_error — %s", joined[:200])
+            return out
+
+    parsed = _parse_tracking_blocks(soup)
+    if parsed["tables"] or parsed["sections"]:
+        out["status"] = "success"
+        out["parsed"] = parsed
+        logger.info(
+            "Public track result: success (tables=%d sections=%d)",
+            len(parsed["tables"]),
+            len(parsed["sections"]),
+        )
+        return out
+
+    body_text = soup.body.get_text("\n", strip=True) if soup.body else ""
+    lowered = body_text.lower()
+    if re.search(r"\bnot found\b|no results|invalid container", lowered):
+        out["status"] = "not_found"
+        out["message"] = "No tracking result found for this container on the response page."
+        logger.info("Public track result: not_found")
+        return out
+
+    if debug_html_path:
+        try:
+            with open(debug_html_path, "w", encoding="utf-8") as f:
+                f.write(html)
+            logger.debug("Saved unknown-layout HTML to %s", debug_html_path)
+        except OSError:
+            pass
+
+    out["status"] = "unknown"
+    out["message"] = (
+        "Could not infer result layout. Save HTML with debug_html_path or inspect final_url."
+    )
+    out["page_text_preview"] = body_text[:2500] if body_text else ""
+    logger.warning(
+        "Public track result: unknown layout (preview len=%d)",
+        len(out["page_text_preview"]),
+    )
+    return out
+
+
+def track_visiwise_dashboard(
+    container_no: str,
+    *,
+    carrier: str = "Maersk",
+    email: Optional[str] = None,
+    password: Optional[str] = None,
+    headless: bool = True,
+    debug_html_path: Optional[str] = None,
+) -> dict[str, Any]:
+    """
+    Log into app.visiwise.co, open Track Shipment (/shipment/new/), set line + container, submit,
+    then parse the tracking details page.
+
+    Credentials: pass ``email`` / ``password``, or set env ``VISIWISE_EMAIL`` / ``VISIWISE_PASSWORD``.
+    Loads ``.env`` via ``load_dotenv()`` when this function runs.
+    """
+    load_dotenv()
+    email = email or os.getenv("VISIWISE_EMAIL", "").strip()
+    password = password or os.getenv("VISIWISE_PASSWORD", "")
+
+    container_no = (container_no or "").strip().upper()
+    out: dict[str, Any] = {
+        "status": "error",
+        "source": "visiwise_dashboard",
+        "container_number": container_no,
+        "carrier": carrier,
+    }
+
+    if not email or not password:
+        out["message"] = (
+            "Missing credentials: set VISIWISE_EMAIL and VISIWISE_PASSWORD "
+            "(e.g. in .env) or pass email= and password=."
+        )
+        logger.error("Dashboard track aborted: missing credentials")
+        return out
+
+    logger.info(
+        "Visiwise dashboard track: container=%s carrier=%s headless=%s",
+        container_no or "(empty)",
+        carrier,
+        headless,
+    )
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=headless,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/123.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1400, "height": 900},
+            locale="en-US",
+            timezone_id="Asia/Kolkata",
+        )
+        page = context.new_page()
+        page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined
+            });
+        """)
+
+        logger.debug("Opening login %s", VISIWISE_LOGIN_NEXT_SHIPMENT)
+        page.goto(VISIWISE_LOGIN_NEXT_SHIPMENT, timeout=120000, wait_until="domcontentloaded")
+        page.locator("#email").wait_for(state="visible", timeout=90000)
+        human_delay(1.5, 2.5)
+        handle_cookie_popup(page)
+        page.locator("#email").fill(email)
+        page.locator("#password").fill(password)
+        page.get_by_role("button", name="Sign in").click()
+        logger.debug("Sign-in submitted")
+
+        if not _wait_post_login(page, timeout_ms=120_000):
+            out["status"] = "login_failed"
+            out["message"] = "Still on login after sign-in — check credentials or 2FA."
+            out["final_url"] = page.url
+            logger.error("Dashboard: login_failed final_url=%s", page.url)
+            if debug_html_path:
+                _save_debug(page, debug_html_path)
+                logger.debug("Saved debug HTML to %s", debug_html_path)
+            browser.close()
+            return out
+
+        logger.debug("Login OK, opening new shipment")
+        human_delay(1.0, 2.0)
+        page.goto(
+            f"{VISIWISE_APP_ROOT}/shipment/new/",
+            timeout=120_000,
+            wait_until="domcontentloaded",
+        )
+        page.locator("#containerNumber").wait_for(state="visible", timeout=90_000)
+        human_delay(0.5, 1.2)
+        _dismiss_blocking_modals(page)
+
+        line_label = resolve_visiwise_carrier(carrier)
+        try:
+            _select_visiwise_line(page, line_label)
+        except Exception as e:
+            out["status"] = "error"
+            out["message"] = f"Could not select carrier “{line_label}”: {e}"
+            logger.warning("Dashboard: carrier select failed: %s", e)
+            if debug_html_path:
+                _save_debug(page, debug_html_path)
+                logger.debug("Saved debug HTML to %s", debug_html_path)
+            browser.close()
+            return out
+
+        logger.debug("Carrier selected: %s", line_label)
+        page.locator("#containerNumber").fill(container_no)
+        human_delay(0.4, 0.9)
+
+        trial_msg = _visiwise_trial_blocked_message(page)
+        if trial_msg:
+            out["status"] = "error"
+            out["message"] = trial_msg
+            out["final_url"] = page.url
+            logger.warning("Dashboard: %s", trial_msg)
+            if debug_html_path:
+                _save_debug(page, debug_html_path)
+            browser.close()
+            return out
+
+        logger.debug("Clicking Track Container")
+        try:
+            page.get_by_role("button", name="Track Container").click(force=True, timeout=15_000)
+        except Exception as e:
+            trial_msg = _visiwise_trial_blocked_message(page)
+            out["status"] = "error"
+            out["message"] = trial_msg or f"Could not submit tracking form: {e}"
+            out["final_url"] = page.url
+            logger.warning("Dashboard: track submit failed: %s", out["message"])
+            if debug_html_path:
+                _save_debug(page, debug_html_path)
+            browser.close()
+            return out
+
+        try:
+            page.wait_for_url("**/shipments/*/tracking/", timeout=120_000)
+        except Exception as e:
+            out["status"] = "error"
+            out["message"] = f"Did not reach tracking page: {e}"
+            out["final_url"] = page.url
+            logger.warning(
+                "Dashboard: tracking URL timeout final_url=%s err=%s",
+                page.url,
+                e,
+            )
+            if debug_html_path:
+                _save_debug(page, debug_html_path)
+                logger.debug("Saved debug HTML to %s", debug_html_path)
+            browser.close()
+            return out
+
+        _dismiss_tracking_tips(page)
+
+        load_err = _wait_for_dashboard_tracking_ready(page)
+        if load_err:
+            out["status"] = "error"
+            out["message"] = load_err
+            out["final_url"] = page.url
+            logger.warning("Dashboard: tracking content not ready: %s", load_err)
+            if debug_html_path:
+                _save_debug(page, debug_html_path)
+                logger.debug("Saved debug HTML to %s", debug_html_path)
+            browser.close()
+            return out
+
+        human_delay(0.3, 0.8)
+        final_url = page.url
+        html = page.content()
+        browser.close()
+
+    out["final_url"] = final_url
+    soup = BeautifulSoup(html, "html.parser")
+    movements = _parse_movements_table(soup)
+    overview = _fill_overview_gaps(_parse_tracking_overview(soup), movements)
+
+    if not movements and not overview:
+        out["status"] = "unknown"
+        out["message"] = (
+            "Tracking page loaded but no movements or overview could be parsed."
+        )
+        logger.warning("Dashboard track result: unknown (empty parse)")
+        return out
+
+    out["status"] = "success"
+    out["overview"] = overview
+    out["movements"] = movements
+
+    if debug_html_path:
+        try:
+            with open(debug_html_path, "w", encoding="utf-8") as f:
+                f.write(html)
+            logger.debug("Saved tracking HTML to %s", debug_html_path)
+        except OSError:
+            pass
+
+    logger.info(
+        "Dashboard track result: success movements=%d overview_keys=%s",
+        len(movements),
+        list(overview.keys()),
+    )
+    return out
+
+
+def track_visiwise(container_no: str, carrier: str, headless: bool = True) -> dict[str, Any]:
+    """
+    Track via the Visiwise dashboard for any supported shipping line.
+
+    ``carrier`` may be an API key (``msc``, ``cmacgm``, …) or the exact Visiwise
+    dropdown label (``CMA CGM``, ``Gold Star Line``, …).
+
+    Returns the same shape as ``script.maersk_tracker.get_maersk_tracking`` on success
+    so ``normalize_maersk`` / ``normalize_visiwise`` can stay unchanged.
+    """
+    line_label = resolve_visiwise_carrier(carrier)
+    raw = track_visiwise_dashboard(container_no, carrier=line_label, headless=headless)
+    if raw.get("status") != "success":
+        err_status = raw.get("status", "error")
+        logger.warning(
+            "track_visiwise: upstream status=%s carrier=%s message=%s",
+            err_status,
+            line_label,
+            (raw.get("message") or "")[:200],
+        )
+        if err_status == "not_found":
+            out_status = "not_found"
+        else:
+            out_status = "error"
+        return {
+            "status": out_status,
+            "container_number": raw.get("container_number") or (container_no or "").strip().upper(),
+            "message": raw.get("message"),
+            "source": raw.get("source"),
+            "carrier": line_label,
+            "final_url": raw.get("final_url"),
+            "visiwise_status": err_status,
+        }
+
+    overview = raw.get("overview") or {}
+    movements = raw.get("movements") or []
+    events: list[dict[str, Any]] = []
+    for m in movements:
+        events.append({
+            "location_name": m.get("location"),
+            "location_terminal": m.get("transport_mode"),
+            "event": m.get("event"),
+            "date_time": m.get("date"),
+        })
+
+    last_evt = None
+    if movements:
+        last_evt = movements[-1].get("event")
+
+    logger.info(
+        "track_visiwise: success carrier=%s events=%d eta=%r container_type=%r",
+        line_label,
+        len(events),
+        overview.get("eta_pod"),
+        overview.get("container_type"),
+    )
+    return {
+        "status": "success",
+        "container_number": raw.get("container_number"),
+        "container_type": _clean_overview_value(overview.get("container_type")),
+        "last_updated": None,
+        "eta": _clean_overview_value(overview.get("eta_pod")),
+        "latest_event": overview.get("last_status") or last_evt,
+        "Port of Loading (POL)": _clean_overview_value(overview.get("pol")),
+        "Port of Discharge (POD)": _clean_overview_value(overview.get("pod")),
+        "events": events,
+        "carrier": line_label,
+    }
+
+
+def track_maersk_visiwise(container_no: str, headless: bool = True) -> dict[str, Any]:
+    """Backward-compatible alias for Maersk-only Visiwise tracking."""
+    return track_visiwise(container_no, carrier="maersk", headless=headless)
+
+
+if __name__ == "__main__":
+    import argparse
+    from pprint import pprint
+
+    parser = argparse.ArgumentParser(description="Visiwise public or dashboard container tracking")
+    parser.add_argument(
+        "--dashboard",
+        action="store_true",
+        help="Use app.visiwise.co (needs VISIWISE_EMAIL + VISIWISE_PASSWORD in env or .env)",
+    )
+    parser.add_argument("--container", default="MRKU0580031", help="Container number")
+    parser.add_argument("--carrier", default="Maersk", help="Shipping line label in the dashboard dropdown")
+    parser.add_argument("--headed", action="store_true", help="Run browser with visible window")
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable DEBUG logging",
+    )
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(levelname)s %(name)s: %(message)s",
+    )
+
+    load_dotenv()
+
+    if args.dashboard:
+        pprint(
+            track_visiwise_dashboard(
+                args.container,
+                carrier=args.carrier,
+                headless=not args.headed,
+            )
+        )
+    elif os.getenv("VISIWISE_EMAIL") and os.getenv("VISIWISE_PASSWORD"):
+        pprint(track_visiwise(args.container, carrier=args.carrier, headless=not args.headed))
+    else:
+        pprint(get_visiwise_maersk_tracking(args.container, headless=not args.headed))
