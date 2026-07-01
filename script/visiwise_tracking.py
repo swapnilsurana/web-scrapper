@@ -18,11 +18,13 @@ import os
 import random
 import re
 import time
-from typing import Any, Iterable, Optional
+from contextlib import contextmanager
+from typing import Any, Iterable, Iterator, Optional
 
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import Playwright, sync_playwright
+from xvfbwrapper import Xvfb
 
 VISIWISE_MAERSK_URL = "https://www.visiwise.co/tracking/container/maersk/"
 VISIWISE_APP_ROOT = "https://app.visiwise.co"
@@ -80,6 +82,14 @@ VISIWISE_CARRIER_LABELS: dict[str, str] = {
 }
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _xvfb_playwright() -> Iterator[Playwright]:
+    """Virtual display for headed Chromium on headless servers (VPS)."""
+    with Xvfb(width=1366, height=768, colordepth=24):
+        with sync_playwright() as p:
+            yield p
 
 
 def _normalize_carrier_key(carrier: str) -> str:
@@ -793,7 +803,7 @@ def get_visiwise_maersk_tracking(
         headless,
     )
 
-    with sync_playwright() as p:
+    with _xvfb_playwright() as p:
         browser = p.chromium.launch(
             headless=headless,
             args=[
@@ -983,7 +993,7 @@ def track_visiwise_dashboard(
         headless,
     )
 
-    with sync_playwright() as p:
+    with _xvfb_playwright() as p:
         browser = p.chromium.launch(
             headless=headless,
             args=[
