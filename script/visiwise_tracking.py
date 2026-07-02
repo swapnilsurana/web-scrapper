@@ -9,6 +9,12 @@ Use ``track_visiwise(container, carrier)`` or the API with ``source: "visiwise"`
 Set credentials in environment (recommended: add to your local .env, never commit):
   VISIWISE_EMAIL=...
   VISIWISE_PASSWORD=...
+
+Optional on cloud/Linux VPS (headed browser without a physical display):
+  USE_XVFB=1
+  (auto-enabled on Linux when the ``Xvfb`` binary is installed; skipped on macOS)
+
+The dashboard API reuses one logged-in browser window (login once per server process).
 """
 
 from __future__ import annotations
@@ -17,14 +23,22 @@ import logging
 import os
 import random
 import re
+import shutil
+import sys
+import threading
 import time
+import atexit
 from contextlib import contextmanager
 from typing import Any, Iterable, Iterator, Optional
 
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from playwright.sync_api import Playwright, sync_playwright
-from xvfbwrapper import Xvfb
+from playwright.sync_api import Browser, BrowserContext, Page, Playwright, sync_playwright
+
+try:
+    from xvfbwrapper import Xvfb
+except ImportError:  # pragma: no cover
+    Xvfb = None  # type: ignore[misc, assignment]
 
 VISIWISE_MAERSK_URL = "https://www.visiwise.co/tracking/container/maersk/"
 VISIWISE_APP_ROOT = "https://app.visiwise.co"
@@ -84,12 +98,240 @@ VISIWISE_CARRIER_LABELS: dict[str, str] = {
 logger = logging.getLogger(__name__)
 
 
+def _should_use_xvfb() -> bool:
+    """
+    Use a virtual framebuffer only when needed (Linux VPS).
+
+    - ``USE_XVFB=1`` forces it on (set in cloud ``.env``).
+    - ``USE_XVFB=0`` forces it off.
+    - Otherwise: auto on Linux when the ``Xvfb`` binary exists; off on macOS/Windows.
+    """
+    flag = os.getenv("USE_XVFB", "").strip().lower()
+    if flag in ("1", "true", "yes", "on"):
+        return Xvfb is not None and shutil.which("Xvfb") is not None
+    if flag in ("0", "false", "no", "off"):
+        return False
+    if Xvfb is None or shutil.which("Xvfb") is None:
+        return False
+    return sys.platform.startswith("linux")
+
+
 @contextmanager
 def _xvfb_playwright() -> Iterator[Playwright]:
-    """Virtual display for headed Chromium on headless servers (VPS)."""
-    with Xvfb(width=1366, height=768, colordepth=24):
+    """Playwright session; wraps Xvfb on cloud Linux when available."""
+    if _should_use_xvfb():
+        logger.debug("Launching Playwright with Xvfb")
+        with Xvfb(width=1366, height=768, colordepth=24):
+            with sync_playwright() as p:
+                yield p
+    else:
         with sync_playwright() as p:
             yield p
+
+
+VISIWISE_SHIPMENT_NEW_URL = f"{VISIWISE_APP_ROOT}/shipment/new/"
+
+
+class VisiwiseBrowserSession:
+    """
+    Reusable logged-in Visiwise dashboard browser.
+
+    Login runs once; later requests only open /shipment/new/, fill the form, and track.
+    A lock serializes tracks because Playwright sync API is not thread-safe.
+    """
+
+    _BROWSER_ARGS = [
+        "--disable-blink-features=AutomationControlled",
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+    ]
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._playwright: Optional[Playwright] = None
+        self._browser: Optional[Browser] = None
+        self._context: Optional[BrowserContext] = None
+        self._page: Optional[Page] = None
+        self._xvfb: Any = None
+        self._logged_in = False
+
+    def shutdown(self) -> None:
+        with self._lock:
+            self._close()
+
+    def _close(self) -> None:
+        self._logged_in = False
+        try:
+            if self._browser:
+                self._browser.close()
+        except Exception:
+            pass
+        self._browser = None
+        self._context = None
+        self._page = None
+        try:
+            if self._playwright:
+                self._playwright.stop()
+        except Exception:
+            pass
+        self._playwright = None
+        if self._xvfb is not None:
+            try:
+                self._xvfb.__exit__(None, None, None)
+            except Exception:
+                pass
+            self._xvfb = None
+
+    def _ensure_browser(self, headless: bool) -> Page:
+        if (
+            self._browser
+            and self._browser.is_connected()
+            and self._page
+            and not self._page.is_closed()
+        ):
+            return self._page
+
+        self._close()
+        if _should_use_xvfb():
+            self._xvfb = Xvfb(width=1366, height=768, colordepth=24)
+            self._xvfb.__enter__()
+
+        self._playwright = sync_playwright().start()
+        self._browser = self._playwright.chromium.launch(
+            headless=headless,
+            args=self._BROWSER_ARGS,
+        )
+        self._context = self._browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/123.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1400, "height": 900},
+            locale="en-US",
+            timezone_id="Asia/Kolkata",
+        )
+        self._page = self._context.new_page()
+        self._page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined
+            });
+        """)
+        self._logged_in = False
+        logger.info("Visiwise browser session started (persistent window)")
+        return self._page
+
+    def _login(self, page: Page, email: str, password: str) -> bool:
+        logger.debug("Visiwise session login %s", VISIWISE_LOGIN_NEXT_SHIPMENT)
+        page.goto(VISIWISE_LOGIN_NEXT_SHIPMENT, timeout=120_000, wait_until="domcontentloaded")
+        page.locator("#email").wait_for(state="visible", timeout=90_000)
+        human_delay(1.0, 1.8)
+        handle_cookie_popup(page)
+        page.locator("#email").fill(email)
+        page.locator("#password").fill(password)
+        page.get_by_role("button", name="Sign in").click()
+        ok = _wait_post_login(page, timeout_ms=120_000)
+        self._logged_in = ok
+        if ok:
+            logger.info("Visiwise session logged in")
+        return ok
+
+    def _ensure_logged_in(self, page: Page, email: str, password: str) -> bool:
+        if self._logged_in and "/login" not in page.url:
+            return True
+        return self._login(page, email, password)
+
+    def track(
+        self,
+        container_no: str,
+        carrier: str,
+        *,
+        email: str,
+        password: str,
+        headless: bool,
+        debug_html_path: Optional[str] = None,
+    ) -> dict[str, Any]:
+        with self._lock:
+            return self._track_locked(
+                container_no,
+                carrier,
+                email=email,
+                password=password,
+                headless=headless,
+                debug_html_path=debug_html_path,
+            )
+
+    def _track_locked(
+        self,
+        container_no: str,
+        carrier: str,
+        *,
+        email: str,
+        password: str,
+        headless: bool,
+        debug_html_path: Optional[str] = None,
+    ) -> dict[str, Any]:
+        container_no = (container_no or "").strip().upper()
+        line_label = resolve_visiwise_carrier(carrier)
+        out: dict[str, Any] = {
+            "status": "error",
+            "source": "visiwise_dashboard",
+            "container_number": container_no,
+            "carrier": line_label,
+        }
+
+        try:
+            page = self._ensure_browser(headless)
+            if not self._ensure_logged_in(page, email, password):
+                out["status"] = "login_failed"
+                out["message"] = "Still on login after sign-in — check credentials or 2FA."
+                out["final_url"] = page.url
+                return out
+
+            result = _visiwise_track_on_shipment_page(
+                page,
+                container_no,
+                line_label,
+                debug_html_path=debug_html_path,
+            )
+            out.update(result)
+
+            if out.get("status") == "success":
+                try:
+                    _visiwise_open_shipment_form(page)
+                    logger.debug("Visiwise session ready at %s", VISIWISE_SHIPMENT_NEW_URL)
+                except Exception as e:
+                    logger.warning("Could not return to shipment form: %s", e)
+
+            return out
+        except Exception as e:
+            logger.exception("Visiwise session track failed, resetting browser")
+            self._close()
+            out["message"] = f"Browser session error: {e}"
+            return out
+
+
+_visiwise_session: Optional[VisiwiseBrowserSession] = None
+_visiwise_session_guard = threading.Lock()
+
+
+def get_visiwise_session() -> VisiwiseBrowserSession:
+    global _visiwise_session
+    with _visiwise_session_guard:
+        if _visiwise_session is None:
+            _visiwise_session = VisiwiseBrowserSession()
+        return _visiwise_session
+
+
+def shutdown_visiwise_session() -> None:
+    global _visiwise_session
+    with _visiwise_session_guard:
+        if _visiwise_session is not None:
+            _visiwise_session.shutdown()
+            _visiwise_session = None
+
+
+atexit.register(shutdown_visiwise_session)
 
 
 def _normalize_carrier_key(carrier: str) -> str:
@@ -280,6 +522,122 @@ def _wait_for_dashboard_tracking_ready(page, timeout_ms: int = 120_000) -> Optio
             return "Tracking page did not finish loading (spinner still visible)."
         return f"Tracking page did not finish loading: {e}"
     return None
+
+
+def _visiwise_open_shipment_form(page: Page) -> None:
+    """Navigate to Track Shipment and wait for the form (reuse on every request)."""
+    if "/shipment/new" not in page.url:
+        page.goto(VISIWISE_SHIPMENT_NEW_URL, timeout=120_000, wait_until="domcontentloaded")
+    page.locator("#containerNumber").wait_for(state="visible", timeout=90_000)
+    human_delay(0.3, 0.7)
+    _dismiss_blocking_modals(page)
+
+
+def _visiwise_track_on_shipment_page(
+    page: Page,
+    container_no: str,
+    line_label: str,
+    *,
+    debug_html_path: Optional[str] = None,
+) -> dict[str, Any]:
+    """
+    On /shipment/new/: select carrier, submit container, wait for tracking page, parse HTML.
+    Does not close the browser.
+    """
+    out: dict[str, Any] = {"status": "error"}
+
+    _visiwise_open_shipment_form(page)
+
+    try:
+        _select_visiwise_line(page, line_label)
+    except Exception as e:
+        out["message"] = f"Could not select carrier “{line_label}”: {e}"
+        out["final_url"] = page.url
+        logger.warning("Dashboard: carrier select failed: %s", e)
+        if debug_html_path:
+            _save_debug(page, debug_html_path)
+        return out
+
+    logger.debug("Carrier selected: %s", line_label)
+    page.locator("#containerNumber").fill("")
+    page.locator("#containerNumber").fill(container_no)
+    human_delay(0.3, 0.7)
+
+    trial_msg = _visiwise_trial_blocked_message(page)
+    if trial_msg:
+        out["message"] = trial_msg
+        out["final_url"] = page.url
+        logger.warning("Dashboard: %s", trial_msg)
+        if debug_html_path:
+            _save_debug(page, debug_html_path)
+        return out
+
+    logger.debug("Clicking Track Container")
+    try:
+        page.get_by_role("button", name="Track Container").click(force=True, timeout=15_000)
+    except Exception as e:
+        trial_msg = _visiwise_trial_blocked_message(page)
+        out["message"] = trial_msg or f"Could not submit tracking form: {e}"
+        out["final_url"] = page.url
+        logger.warning("Dashboard: track submit failed: %s", out["message"])
+        if debug_html_path:
+            _save_debug(page, debug_html_path)
+        return out
+
+    try:
+        page.wait_for_url("**/shipments/*/tracking/", timeout=120_000)
+    except Exception as e:
+        out["message"] = f"Did not reach tracking page: {e}"
+        out["final_url"] = page.url
+        logger.warning("Dashboard: tracking URL timeout final_url=%s err=%s", page.url, e)
+        if debug_html_path:
+            _save_debug(page, debug_html_path)
+        return out
+
+    _dismiss_tracking_tips(page)
+
+    load_err = _wait_for_dashboard_tracking_ready(page)
+    if load_err:
+        out["message"] = load_err
+        out["final_url"] = page.url
+        logger.warning("Dashboard: tracking content not ready: %s", load_err)
+        if debug_html_path:
+            _save_debug(page, debug_html_path)
+        return out
+
+    human_delay(0.3, 0.8)
+    final_url = page.url
+    html = page.content()
+
+    soup = BeautifulSoup(html, "html.parser")
+    movements = _parse_movements_table(soup)
+    overview = _fill_overview_gaps(_parse_tracking_overview(soup), movements)
+
+    if not movements and not overview:
+        out["status"] = "unknown"
+        out["message"] = "Tracking page loaded but no movements or overview could be parsed."
+        out["final_url"] = final_url
+        logger.warning("Dashboard track result: unknown (empty parse)")
+        return out
+
+    out["status"] = "success"
+    out["final_url"] = final_url
+    out["overview"] = overview
+    out["movements"] = movements
+
+    if debug_html_path:
+        try:
+            with open(debug_html_path, "w", encoding="utf-8") as f:
+                f.write(html)
+        except OSError:
+            pass
+
+    logger.info(
+        "Dashboard track result: success movements=%d overview_keys=%s",
+        len(movements),
+        list(overview.keys()),
+    )
+    return out
 
 
 def _parse_movements_table(soup: BeautifulSoup) -> list[dict[str, str]]:
@@ -958,49 +1316,84 @@ def track_visiwise_dashboard(
     password: Optional[str] = None,
     headless: bool = True,
     debug_html_path: Optional[str] = None,
+    use_persistent_session: bool = True,
 ) -> dict[str, Any]:
     """
-    Log into app.visiwise.co, open Track Shipment (/shipment/new/), set line + container, submit,
-    then parse the tracking details page.
+    Track via app.visiwise.co dashboard.
 
-    Credentials: pass ``email`` / ``password``, or set env ``VISIWISE_EMAIL`` / ``VISIWISE_PASSWORD``.
-    Loads ``.env`` via ``load_dotenv()`` when this function runs.
+    By default reuses one logged-in browser window across API calls (login once).
+    Subsequent requests only open ``/shipment/new/``, fill the form, and track.
+
+    Credentials: ``VISIWISE_EMAIL`` / ``VISIWISE_PASSWORD`` in env or pass explicitly.
     """
     load_dotenv()
     email = email or os.getenv("VISIWISE_EMAIL", "").strip()
     password = password or os.getenv("VISIWISE_PASSWORD", "")
 
     container_no = (container_no or "").strip().upper()
+    line_label = resolve_visiwise_carrier(carrier)
+
+    if not email or not password:
+        return {
+            "status": "error",
+            "source": "visiwise_dashboard",
+            "container_number": container_no,
+            "carrier": line_label,
+            "message": (
+                "Missing credentials: set VISIWISE_EMAIL and VISIWISE_PASSWORD "
+                "(e.g. in .env) or pass email= and password=."
+            ),
+        }
+
+    logger.info(
+        "Visiwise dashboard track: container=%s carrier=%s headless=%s persistent=%s",
+        container_no or "(empty)",
+        line_label,
+        headless,
+        use_persistent_session,
+    )
+
+    if use_persistent_session:
+        return get_visiwise_session().track(
+            container_no,
+            line_label,
+            email=email,
+            password=password,
+            headless=headless,
+            debug_html_path=debug_html_path,
+        )
+
+    return _track_visiwise_dashboard_ephemeral(
+        container_no,
+        line_label,
+        email=email,
+        password=password,
+        headless=headless,
+        debug_html_path=debug_html_path,
+    )
+
+
+def _track_visiwise_dashboard_ephemeral(
+    container_no: str,
+    line_label: str,
+    *,
+    email: str,
+    password: str,
+    headless: bool,
+    debug_html_path: Optional[str] = None,
+) -> dict[str, Any]:
+    """One-shot track: open browser, login, track, close (for tests / --no-persist)."""
     out: dict[str, Any] = {
         "status": "error",
         "source": "visiwise_dashboard",
         "container_number": container_no,
-        "carrier": carrier,
+        "carrier": line_label,
     }
-
-    if not email or not password:
-        out["message"] = (
-            "Missing credentials: set VISIWISE_EMAIL and VISIWISE_PASSWORD "
-            "(e.g. in .env) or pass email= and password=."
-        )
-        logger.error("Dashboard track aborted: missing credentials")
-        return out
-
-    logger.info(
-        "Visiwise dashboard track: container=%s carrier=%s headless=%s",
-        container_no or "(empty)",
-        carrier,
-        headless,
-    )
 
     with _xvfb_playwright() as p:
         browser = p.chromium.launch(
             headless=headless,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ],
+            args=VisiwiseBrowserSession._BROWSER_ARGS,
         )
         context = browser.new_context(
             user_agent=(
@@ -1019,147 +1412,30 @@ def track_visiwise_dashboard(
             });
         """)
 
-        logger.debug("Opening login %s", VISIWISE_LOGIN_NEXT_SHIPMENT)
-        page.goto(VISIWISE_LOGIN_NEXT_SHIPMENT, timeout=120000, wait_until="domcontentloaded")
-        page.locator("#email").wait_for(state="visible", timeout=90000)
-        human_delay(1.5, 2.5)
+        page.goto(VISIWISE_LOGIN_NEXT_SHIPMENT, timeout=120_000, wait_until="domcontentloaded")
+        page.locator("#email").wait_for(state="visible", timeout=90_000)
+        human_delay(1.0, 1.8)
         handle_cookie_popup(page)
         page.locator("#email").fill(email)
         page.locator("#password").fill(password)
         page.get_by_role("button", name="Sign in").click()
-        logger.debug("Sign-in submitted")
 
         if not _wait_post_login(page, timeout_ms=120_000):
             out["status"] = "login_failed"
             out["message"] = "Still on login after sign-in — check credentials or 2FA."
             out["final_url"] = page.url
-            logger.error("Dashboard: login_failed final_url=%s", page.url)
-            if debug_html_path:
-                _save_debug(page, debug_html_path)
-                logger.debug("Saved debug HTML to %s", debug_html_path)
             browser.close()
             return out
 
-        logger.debug("Login OK, opening new shipment")
-        human_delay(1.0, 2.0)
-        page.goto(
-            f"{VISIWISE_APP_ROOT}/shipment/new/",
-            timeout=120_000,
-            wait_until="domcontentloaded",
+        result = _visiwise_track_on_shipment_page(
+            page,
+            container_no,
+            line_label,
+            debug_html_path=debug_html_path,
         )
-        page.locator("#containerNumber").wait_for(state="visible", timeout=90_000)
-        human_delay(0.5, 1.2)
-        _dismiss_blocking_modals(page)
-
-        line_label = resolve_visiwise_carrier(carrier)
-        try:
-            _select_visiwise_line(page, line_label)
-        except Exception as e:
-            out["status"] = "error"
-            out["message"] = f"Could not select carrier “{line_label}”: {e}"
-            logger.warning("Dashboard: carrier select failed: %s", e)
-            if debug_html_path:
-                _save_debug(page, debug_html_path)
-                logger.debug("Saved debug HTML to %s", debug_html_path)
-            browser.close()
-            return out
-
-        logger.debug("Carrier selected: %s", line_label)
-        page.locator("#containerNumber").fill(container_no)
-        human_delay(0.4, 0.9)
-
-        trial_msg = _visiwise_trial_blocked_message(page)
-        if trial_msg:
-            out["status"] = "error"
-            out["message"] = trial_msg
-            out["final_url"] = page.url
-            logger.warning("Dashboard: %s", trial_msg)
-            if debug_html_path:
-                _save_debug(page, debug_html_path)
-            browser.close()
-            return out
-
-        logger.debug("Clicking Track Container")
-        try:
-            page.get_by_role("button", name="Track Container").click(force=True, timeout=15_000)
-        except Exception as e:
-            trial_msg = _visiwise_trial_blocked_message(page)
-            out["status"] = "error"
-            out["message"] = trial_msg or f"Could not submit tracking form: {e}"
-            out["final_url"] = page.url
-            logger.warning("Dashboard: track submit failed: %s", out["message"])
-            if debug_html_path:
-                _save_debug(page, debug_html_path)
-            browser.close()
-            return out
-
-        try:
-            page.wait_for_url("**/shipments/*/tracking/", timeout=120_000)
-        except Exception as e:
-            out["status"] = "error"
-            out["message"] = f"Did not reach tracking page: {e}"
-            out["final_url"] = page.url
-            logger.warning(
-                "Dashboard: tracking URL timeout final_url=%s err=%s",
-                page.url,
-                e,
-            )
-            if debug_html_path:
-                _save_debug(page, debug_html_path)
-                logger.debug("Saved debug HTML to %s", debug_html_path)
-            browser.close()
-            return out
-
-        _dismiss_tracking_tips(page)
-
-        load_err = _wait_for_dashboard_tracking_ready(page)
-        if load_err:
-            out["status"] = "error"
-            out["message"] = load_err
-            out["final_url"] = page.url
-            logger.warning("Dashboard: tracking content not ready: %s", load_err)
-            if debug_html_path:
-                _save_debug(page, debug_html_path)
-                logger.debug("Saved debug HTML to %s", debug_html_path)
-            browser.close()
-            return out
-
-        human_delay(0.3, 0.8)
-        final_url = page.url
-        html = page.content()
         browser.close()
-
-    out["final_url"] = final_url
-    soup = BeautifulSoup(html, "html.parser")
-    movements = _parse_movements_table(soup)
-    overview = _fill_overview_gaps(_parse_tracking_overview(soup), movements)
-
-    if not movements and not overview:
-        out["status"] = "unknown"
-        out["message"] = (
-            "Tracking page loaded but no movements or overview could be parsed."
-        )
-        logger.warning("Dashboard track result: unknown (empty parse)")
+        out.update(result)
         return out
-
-    out["status"] = "success"
-    out["overview"] = overview
-    out["movements"] = movements
-
-    if debug_html_path:
-        try:
-            with open(debug_html_path, "w", encoding="utf-8") as f:
-                f.write(html)
-            logger.debug("Saved tracking HTML to %s", debug_html_path)
-        except OSError:
-            pass
-
-    logger.info(
-        "Dashboard track result: success movements=%d overview_keys=%s",
-        len(movements),
-        list(overview.keys()),
-    )
-    return out
 
 
 def track_visiwise(container_no: str, carrier: str, headless: bool = True) -> dict[str, Any]:
@@ -1251,6 +1527,11 @@ if __name__ == "__main__":
     parser.add_argument("--carrier", default="Maersk", help="Shipping line label in the dashboard dropdown")
     parser.add_argument("--headed", action="store_true", help="Run browser with visible window")
     parser.add_argument(
+        "--no-persist",
+        action="store_true",
+        help="Close browser after each run instead of reusing the logged-in session",
+    )
+    parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -1271,6 +1552,7 @@ if __name__ == "__main__":
                 args.container,
                 carrier=args.carrier,
                 headless=not args.headed,
+                use_persistent_session=not args.no_persist,
             )
         )
     elif os.getenv("VISIWISE_EMAIL") and os.getenv("VISIWISE_PASSWORD"):
