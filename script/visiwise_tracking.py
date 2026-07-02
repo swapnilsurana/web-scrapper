@@ -19,6 +19,7 @@ The dashboard API reuses one logged-in browser window (login once per server pro
 
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 import random
@@ -27,7 +28,7 @@ import shutil
 import sys
 import threading
 import time
-import atexit
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Any, Iterable, Iterator, Optional
 
@@ -137,7 +138,8 @@ class VisiwiseBrowserSession:
     Reusable logged-in Visiwise dashboard browser.
 
     Login runs once; later requests only open /shipment/new/, fill the form, and track.
-    A lock serializes tracks because Playwright sync API is not thread-safe.
+    Playwright sync API is bound to one thread — all browser work runs on a dedicated
+    executor so callers may invoke ``track()`` from any worker thread.
     """
 
     _BROWSER_ARGS = [
@@ -147,17 +149,27 @@ class VisiwiseBrowserSession:
     ]
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        self._executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="visiwise-browser",
+        )
         self._playwright: Optional[Playwright] = None
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
         self._xvfb: Any = None
         self._logged_in = False
+        self._closed = False
 
     def shutdown(self) -> None:
-        with self._lock:
-            self._close()
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._executor.submit(self._close).result(timeout=60)
+        except Exception:
+            logger.debug("Visiwise session close during shutdown", exc_info=True)
+        self._executor.shutdown(wait=True, cancel_futures=False)
 
     def _close(self) -> None:
         self._logged_in = False
@@ -251,15 +263,36 @@ class VisiwiseBrowserSession:
         headless: bool,
         debug_html_path: Optional[str] = None,
     ) -> dict[str, Any]:
-        with self._lock:
-            return self._track_locked(
-                container_no,
-                carrier,
-                email=email,
-                password=password,
-                headless=headless,
-                debug_html_path=debug_html_path,
-            )
+        if self._closed:
+            raise RuntimeError("Visiwise browser session is shut down")
+        future = self._executor.submit(
+            self._track_on_browser_thread,
+            container_no,
+            carrier,
+            email,
+            password,
+            headless,
+            debug_html_path,
+        )
+        return future.result()
+
+    def _track_on_browser_thread(
+        self,
+        container_no: str,
+        carrier: str,
+        email: str,
+        password: str,
+        headless: bool,
+        debug_html_path: Optional[str],
+    ) -> dict[str, Any]:
+        return self._track_locked(
+            container_no,
+            carrier,
+            email=email,
+            password=password,
+            headless=headless,
+            debug_html_path=debug_html_path,
+        )
 
     def _track_locked(
         self,
