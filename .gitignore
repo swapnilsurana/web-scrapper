@@ -25,3 +25,6 @@ test-results/
 
 # macOS
 .DS_Store
+
+downloaded_files/pipfinding.lock
+google-chrome-stable_current_amd64.deb
